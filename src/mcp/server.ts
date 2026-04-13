@@ -90,7 +90,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Page title to retrieve" },
+        title: {
+          type: "string",
+          description:
+            "Page title in the graph (e.g. 'Heather' for a person, 'Heather (relationship)' for a relationship vault file)",
+        },
       },
       required: ["title"],
     },
@@ -161,7 +165,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Wiki page title" },
+        title: {
+          type: "string",
+          description:
+            "Wiki page title (relationship entities are titled '{Person} (relationship)')",
+        },
         metadata: {
           type: "object",
           description: "Fields to merge into existing metadata",

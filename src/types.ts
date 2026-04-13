@@ -12,6 +12,8 @@ export type SourceType =
   | "note"
   | "book"
   | "video"
+  | "conversation"
+  | "chat"
   | "other";
 export type QualityTier =
   | "peer-reviewed"
@@ -19,6 +21,7 @@ export type QualityTier =
   | "book"
   | "blog"
   | "social"
+  | "personal"
   | "unknown";
 
 export interface Source {
@@ -179,8 +182,31 @@ export type LLMProvider =
   | "ollama"
   | "openai-compatible";
 
+/** Optional owner of the knowledge base — used to ground extraction (e.g. replace "the author" with a name). */
+export interface QuickyAuthor {
+  name: string;
+  context?: string;
+}
+
+/**
+ * Override how the primary wiki page title is derived for a given `kind`.
+ * Use when two sources would otherwise collide on the same title (e.g. person vs relationship notes for one name).
+ *
+ * **Template placeholders** (see README “Configuration → Primary page titles”):
+ * - `{{stem}}` / `{{sourceTitle}}` — file-derived title (usually the filename stem).
+ * - `{{anyKey}}` — YAML frontmatter (and ingest metadata overrides); missing/empty values fall back to the stem.
+ */
+export interface PrimaryPageTitleRule {
+  kind: string;
+  template: string;
+}
+
 export interface QuickyConfig {
   name: string;
+  /** When set, used as the fallback quality tier for sources without explicit `quality` / DOI / publisher in frontmatter. */
+  defaultQualityTier?: QualityTier;
+  /** Owner / primary subject of first-person notes and chat-derived sources. */
+  author?: QuickyAuthor;
   llm: {
     provider: LLMProvider;
     model: string;
@@ -203,6 +229,11 @@ export interface QuickyConfig {
   kindRules?: Array<{ pattern: string; kind: string }>;
   /** Optional extra system prompt per page `kind` during claim extraction. */
   entityPrompts?: Record<string, string>;
+  /**
+   * First rule where `kind` equals the inferred page kind wins. If none match, title defaults to
+   * `frontmatter.name` → `frontmatter.title` → source stem.
+   */
+  primaryPageTitleRules?: PrimaryPageTitleRule[];
 }
 
 export const DEFAULT_CONFIG: QuickyConfig = {
@@ -229,6 +260,7 @@ export const DEFAULT_CONFIG: QuickyConfig = {
     book: 0.85,
     blog: 0.5,
     social: 0.3,
+    personal: 0.7,
     unknown: 0.4,
   },
 };

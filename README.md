@@ -197,6 +197,36 @@ my-wiki/
 └── wiki/                    # compiled output (Obsidian-compatible markdown)
 ```
 
+## Configuration
+
+Project settings live in **`.quicky/config.yaml`** (JSON syntax is fine). Besides `llm`, `paths`, and `metabolism`, you can set optional **`kindRules`**, **`entityPrompts`**, **`primaryPageTitleRules`**, **`author`**, **`defaultQualityTier`**, and **`qualityWeights`** — see the type definitions in the library or your project’s config for examples.
+
+### Primary page titles (`primaryPageTitleRules`)
+
+When ingesting a source, Quicky syncs a **primary wiki page** for that file’s entity (`kind` + frontmatter metadata). By default the page title is **`name` → `title` → filename stem**, which can collide if two files share a stem but represent different entity kinds (e.g. a person note and a relationship note both named `Jane.md`).
+
+**`primaryPageTitleRules`** is a list of `{ "kind": "<page kind>", "template": "..." }` objects. The **first** rule whose `kind` matches the inferred page kind is used. **`template`** may include placeholders:
+
+| Placeholder | Resolved from |
+|-------------|----------------|
+| `{{stem}}` | File-derived title (usually the filename without extension). Same as `{{sourceTitle}}`. |
+| `{{sourceTitle}}` | Same as `{{stem}}`. |
+| `{{anyField}}` | Any key from the file’s YAML frontmatter (and ingest metadata overrides). If the value is missing or empty, the placeholder falls back to the stem. |
+
+Literal text outside `{{...}}` is copied as-is (spaces, parentheses, suffixes).
+
+**Example** — relationship pages titled like the person, but disambiguated in the graph:
+
+```json
+"primaryPageTitleRules": [
+  { "kind": "relationship", "template": "{{person}} (relationship)" }
+]
+```
+
+With frontmatter `person: Jane` and file `Jane.md`, the graph page title becomes **`Jane (relationship)`**; a separate person source can still use the default title **`Jane`**.
+
+You can define multiple rules for different `kind` values. Kinds are whatever your **`kindRules`** and frontmatter produce (not built into Quicky).
+
 ## Development
 
 ```bash

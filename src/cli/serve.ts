@@ -7,6 +7,7 @@ import type { QuickyConfig, LLMAdapter } from "../types.js";
 import { generateHealthReport } from "../metabolism/health.js";
 import { renderGraphData } from "../render/graph-viz.js";
 import { queryKnowledge } from "../graph/query.js";
+import { renderAllPages } from "../render/markdown.js";
 
 // Simple TTL cache — single user, invalidate on writes
 class TTLCache {
@@ -205,7 +206,8 @@ export function startDashboard(
         } else if (req.method === "OPTIONS") {
           res.writeHead(204, {
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Methods":
+              "GET, POST, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type",
           });
           res.end();
@@ -242,6 +244,14 @@ export function startDashboard(
           json(res, { success: true });
         } else if (url.pathname === "/api/prune" && req.method === "POST") {
           const pruned = store.deleteEmptyPages();
+          cache.invalidate();
+          json(res, { success: true, pruned });
+        } else if (
+          url.pathname === "/api/prune-topics" &&
+          req.method === "POST"
+        ) {
+          const pruned = store.deleteEmptyTopicPages();
+          await renderAllPages(store, config.paths.wiki);
           cache.invalidate();
           json(res, { success: true, pruned });
         } else {
@@ -673,18 +683,30 @@ async function openPage(pageId){
   if(page.error)return;
   let html='';
   const hasSummary=page.summary&&!page.summary.match(/no summary yet/i);
+  const hasClaims=page.claims&&page.claims.length;
+  const hasLinks=page.linkedPages&&page.linkedPages.length;
+  const hasMd=!!page.markdown;
   if(hasSummary)html+='<div class="slideOver-section"><h3>Summary</h3><p style="font-size:13px;color:var(--text-dim)">'+esc(page.summary)+'</p></div>';
-  if(page.claims&&page.claims.length){
+  if(hasClaims){
     html+='<div class="slideOver-section"><h3>Claims ('+page.claims.length+')</h3>';
     html+=page.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+'<div style="flex:1"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px">'+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div><button class="del-page-claim" data-claim-id="'+c.id+'" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:13px;padding:2px 6px;border-radius:4px;flex-shrink:0" title="Delete claim">✕</button></div>').join('');
     html+='</div>';
   }
-  if(page.linkedPages&&page.linkedPages.length){
+  if(hasLinks){
     html+='<div class="slideOver-section"><h3>Linked Pages ('+page.linkedPages.length+')</h3><div>';
     html+=page.linkedPages.map(p=>'<span class="linked-page-chip" data-page-id="'+p.id+'">'+esc(p.title)+'</span>').join('');
     html+='</div></div>';
   }
   if(page.markdown)html+='<div class="slideOver-section"><div class="md-content">'+renderMarkdown(page.markdown)+'</div></div>';
+  const sparse=!hasSummary&&!hasClaims&&!hasLinks&&!hasMd;
+  if(sparse){
+    html+='<div class="slideOver-section"><p style="font-size:13px;color:var(--text-dim);line-height:1.45">This page has no claims or compiled wiki file yet. Ingest sources that mention this topic, or edit the vault if this is a primary entity.</p></div>';
+    if(page.kind)html+='<div class="slideOver-section"><h3>Kind</h3><p style="font-size:13px"><span class="badge badge-accent">'+esc(page.kind)+'</span></p></div>';
+    const meta=page.metadata&&typeof page.metadata==='object'?page.metadata:null;
+    if(meta&&Object.keys(meta).length){
+      html+='<div class="slideOver-section"><h3>Entity metadata</h3><pre style="font-size:11px;overflow:auto;max-height:220px;background:var(--bg-elevated);padding:10px;border-radius:var(--radius-xs);border:1px solid var(--border)">'+esc(JSON.stringify(meta,null,2))+'</pre></div>';
+    }
+  }
   html+='<div class="slideOver-section" style="border-top:2px solid var(--red-dim);padding-top:16px;margin-top:8px"><button id="delete-page-btn" style="background:var(--red-dim);color:var(--red);border:1px solid transparent;border-radius:var(--radius-xs);padding:6px 16px;cursor:pointer;font-size:12px;font-weight:600;transition:var(--transition)" onmouseover="this.style.background=\\'var(--red)\\';this.style.color=\\'white\\'" onmouseout="this.style.background=\\'var(--red-dim)\\';this.style.color=\\'var(--red)\\'">Delete Page</button></div>';
   openSlideOver(html,page.title);
   document.querySelectorAll('.del-page-claim').forEach(btn=>{btn.addEventListener('click',async()=>{if(!confirm('Delete this claim?'))return;await fetch('/api/claim?id='+btn.dataset.claimId,{method:'DELETE'});await refreshData();openPage(page.id);});});
@@ -751,8 +773,9 @@ function renderStatsRow(){
 function sCard(v,l,c){return'<div class="stat-card '+c+'"><div class="value">'+v+'</div><div class="label">'+l+'</div></div>';}
 function renderSidebarStats(){
   const{stats}=DATA;
-  document.getElementById('sidebar-stats').innerHTML='<div class="sidebar-stat"><span class="label">Sources</span><span class="val">'+stats.sources+'</span></div><div class="sidebar-stat"><span class="label">Pages</span><span class="val">'+stats.pages+'</span></div><div class="sidebar-stat"><span class="label">Claims</span><span class="val">'+stats.claims+'</span></div><div class="sidebar-stat"><span class="label">Events</span><span class="val">'+stats.events+'</span></div><div style="margin-top:10px"><button id="prune-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--red)\\';this.style.color=\\'var(--red)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Empty Pages</button></div>';
+  document.getElementById('sidebar-stats').innerHTML='<div class="sidebar-stat"><span class="label">Sources</span><span class="val">'+stats.sources+'</span></div><div class="sidebar-stat"><span class="label">Pages</span><span class="val">'+stats.pages+'</span></div><div class="sidebar-stat"><span class="label">Claims</span><span class="val">'+stats.claims+'</span></div><div class="sidebar-stat"><span class="label">Events</span><span class="val">'+stats.events+'</span></div><div style="margin-top:10px;display:flex;flex-direction:column;gap:6px"><button id="prune-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--red)\\';this.style.color=\\'var(--red)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Empty Pages</button><button id="prune-topics-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--accent)\\';this.style.color=\\'var(--accent)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Topic Stubs</button></div>';
   document.getElementById('prune-btn').addEventListener('click',async()=>{if(!confirm('Delete all pages with no claims?'))return;const r=await fetch('/api/prune',{method:'POST'}).then(r=>r.json());alert('Pruned '+r.pruned+' empty pages');await refreshData();});
+  document.getElementById('prune-topics-btn').addEventListener('click',async()=>{if(!confirm('Delete topic pages (kind=topic) that have no claims? Typed entities are kept.'))return;const r=await fetch('/api/prune-topics',{method:'POST'}).then(x=>x.json());alert('Pruned '+r.pruned+' topic stubs; wiki re-rendered.');await refreshData();});
   document.getElementById('nav-claims-count').textContent=stats.claims;
   document.getElementById('nav-pages-count').textContent=stats.pages;
 }

@@ -57,7 +57,9 @@ export async function renderWikiPage(
     "",
     "## Claims",
     "",
-    ...claims.map((c) => formatClaim(c)),
+    ...(claims.length > 0
+      ? claims.map((c) => formatClaim(c))
+      : ["_No claims yet._"]),
     "",
   ];
 
@@ -108,9 +110,6 @@ export async function renderAllPages(
   const pages = store.listPages();
   const paths: string[] = [];
   for (const page of pages) {
-    // Skip pages with no claims — don't clutter wiki with empty stubs
-    const claims = store.getClaimsByPage(page.id);
-    if (claims.length === 0) continue;
     const p = await renderWikiPage(store, page, wikiDir);
     paths.push(p);
   }

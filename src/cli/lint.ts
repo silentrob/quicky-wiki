@@ -1,9 +1,12 @@
 import chalk from "chalk";
 import ora from "ora";
-import { requireInit, openStore, createLLM, loadConfig } from "./context.js";
+import { requireInit, openStore, loadConfig } from "./context.js";
 import { renderAllPages } from "../render/markdown.js";
 
-export async function lintCommand(opts: { prune?: boolean }): Promise<void> {
+export async function lintCommand(opts: {
+  prune?: boolean;
+  pruneTopics?: boolean;
+}): Promise<void> {
   requireInit();
   const store = openStore();
   const config = await loadConfig();
@@ -92,6 +95,22 @@ export async function lintCommand(opts: { prune?: boolean }): Promise<void> {
       }
       for (const i of infos) {
         console.log(`  ${chalk.blue("ℹ")} ${i.message}`);
+      }
+    }
+
+    if (opts.pruneTopics) {
+      const pruned = store.deleteEmptyTopicPages();
+      await renderAllPages(store, config.paths.wiki);
+      if (pruned > 0) {
+        console.log(
+          chalk.green(
+            `\n  Pruned ${pruned} empty topic page(s); wiki re-rendered`,
+          ),
+        );
+      } else {
+        console.log(
+          chalk.dim(`\n  No empty topic pages to prune; wiki re-rendered`),
+        );
       }
     }
 

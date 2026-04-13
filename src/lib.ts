@@ -13,7 +13,11 @@ export { KnowledgeStore } from "./graph/store.js";
 export { queryKnowledge } from "./graph/query.js";
 
 // Ingest pipeline
-export { ingestSource, inferPageKind } from "./compiler/ingest.js";
+export {
+  ingestSource,
+  inferPageKind,
+  resolvePrimaryPageTitle,
+} from "./compiler/ingest.js";
 export type { IngestSourceOptions, IngestProgress } from "./compiler/ingest.js";
 
 // Knowledge resolution (summaries, page rendering)
@@ -29,6 +33,8 @@ export { DEFAULT_CONFIG } from "./types.js";
 
 // Types
 export type {
+  QuickyAuthor,
+  PrimaryPageTitleRule,
   QuickyConfig,
   WikiPage,
   Claim,

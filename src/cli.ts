@@ -10,6 +10,7 @@ import { discoverCommand } from "./cli/discover.js";
 import { lintCommand } from "./cli/lint.js";
 import { startDashboard } from "./cli/serve.js";
 import { watchCommand } from "./cli/watch.js";
+import { pruneTopicsCommand } from "./cli/prune-topics.js";
 import { createQuickyWiki } from "./cli/create.js";
 import { startMCPServer } from "./mcp/server.js";
 import {
@@ -26,7 +27,7 @@ program
   .description(
     "Quicky Wiki — LLM-powered knowledge compiler with temporal tracking",
   )
-  .version("0.1.0");
+  .version("0.1.2");
 
 program
   .command("init")
@@ -55,11 +56,11 @@ program
   .description("Ingest a source document or URL into knowledge base")
   .option(
     "-t, --type <type>",
-    "Source type (article|paper|repo|book|note|other)",
+    "Source type (article|paper|repo|book|note|conversation|chat|other)",
   )
   .option(
     "-q, --quality <quality>",
-    "Quality tier (peer-reviewed|official-docs|book|blog|social)",
+    "Quality tier (peer-reviewed|official-docs|book|blog|social|personal|unknown)",
   )
   .action(ingestCommand);
 
@@ -120,7 +121,18 @@ program
   .command("lint")
   .description("Check knowledge base for issues")
   .option("--prune", "Delete empty pages with no claims")
+  .option(
+    "--prune-topics",
+    "Delete empty topic pages only (keeps typed entities), then re-render wiki",
+  )
   .action(lintCommand);
+
+program
+  .command("prune-topics")
+  .description(
+    "Delete topic pages with no claims (keeps person/project/etc.), re-render wiki",
+  )
+  .action(pruneTopicsCommand);
 
 program
   .command("watch")

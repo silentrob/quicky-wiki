@@ -6,6 +6,7 @@ const QUALITY_MULTIPLIERS: Record<QualityTier, number> = {
   book: 0.85,
   blog: 0.6,
   social: 0.35,
+  personal: 0.72,
   unknown: 0.45,
 };
 

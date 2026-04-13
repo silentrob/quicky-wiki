@@ -59,6 +59,56 @@ export function inferPageKind(
   return "topic";
 }
 
+const TITLE_PLACEHOLDER_RE = /\{\{\s*([\w.]+)\s*\}\}/g;
+
+function applyPrimaryTitleTemplate(
+  template: string,
+  frontmatter: Record<string, unknown>,
+  stem: string,
+): string {
+  const out = template.replace(TITLE_PLACEHOLDER_RE, (_, rawKey: string) => {
+    const key = rawKey.trim();
+    if (key === "stem" || key === "sourceTitle") return stem;
+    const v = frontmatter[key];
+    if (v != null && String(v).trim() !== "") return String(v).trim();
+    return stem;
+  });
+  const t = out.trim();
+  return t || stem;
+}
+
+/**
+ * Wiki graph title for the primary entity page for this source.
+ * Optional `config.primaryPageTitleRules` supplies per-kind templates; otherwise uses
+ * `name` / `title` from frontmatter, then the file-derived `sourceTitle`.
+ */
+export function resolvePrimaryPageTitle(
+  kind: string,
+  frontmatter: Record<string, unknown>,
+  sourceTitle: string,
+  config?: QuickyConfig,
+): string {
+  const rules = config?.primaryPageTitleRules ?? [];
+  for (const rule of rules) {
+    if (rule.kind === kind && rule.template?.trim()) {
+      return applyPrimaryTitleTemplate(
+        rule.template.trim(),
+        frontmatter,
+        sourceTitle,
+      );
+    }
+  }
+
+  const n = frontmatter.name ?? frontmatter.title;
+  if (n != null && String(n).trim()) {
+    return String(n).trim();
+  }
+  if (frontmatter.title != null && String(frontmatter.title).trim()) {
+    return String(frontmatter.title).trim();
+  }
+  return sourceTitle;
+}
+
 function titleToWikiPath(title: string): string {
   return (
     title
@@ -140,10 +190,16 @@ export async function ingestSource(
     opts?.kind ??
     inferPageKind(filePath, frontmatter, opts?.config?.kindRules);
   const pageMetadata = cloneMetadata(frontmatter, opts?.metadata);
+  const primaryPageTitle = resolvePrimaryPageTitle(
+    resolvedKind,
+    pageMetadata,
+    title,
+    opts?.config,
+  );
 
   const existing = store.getSourceByPath(filePath);
   if (existing && existing.contentHash === contentHash) {
-    syncPrimaryPageEntity(store, title, resolvedKind, pageMetadata);
+    syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
     return {
       sourceId: existing.id,
       sourceTitle: existing.title,
@@ -156,7 +212,8 @@ export async function ingestSource(
   }
 
   const type = opts?.type || inferSourceType(filePath, frontmatter);
-  const qualityTier = opts?.qualityTier || inferQuality(frontmatter);
+  const qualityTier =
+    opts?.qualityTier ?? inferQuality(frontmatter, opts?.config);
 
   let source: Source;
   if (existing) {
@@ -177,6 +234,7 @@ export async function ingestSource(
   const extractCtx = {
     pageKind: resolvedKind,
     entityPrompts: opts?.config?.entityPrompts,
+    author: opts?.config?.author,
   };
 
   progress("extracting", `Extracting claims from "${title}"...`);
@@ -200,7 +258,7 @@ export async function ingestSource(
   await resolveKnowledge(store, llm, diff, source);
   progress("done", `Ingestion complete`);
 
-  syncPrimaryPageEntity(store, title, resolvedKind, pageMetadata);
+  syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
 
   return diff;
 }
@@ -213,12 +271,22 @@ interface ExtractedClaim {
   dependsOnStatements: string[];
 }
 
+function authorPromptExtra(author?: QuickyConfig["author"]): string {
+  if (!author?.name?.trim()) return "";
+  const ctx = author.context?.trim();
+  return `\n\nThe knowledge base belongs to ${author.name.trim()}.${ctx ? ` ${ctx}` : ""} When extracting claims, refer to this person by name ("${author.name.trim()}") instead of vague phrases like "the author", "the user", or "I" (unless the source is a direct first-person quote).`;
+}
+
 async function extractClaims(
   llm: LLMAdapter,
   content: string,
   title: string,
   source: Source,
-  ctx: { pageKind: string; entityPrompts?: Record<string, string> },
+  ctx: {
+    pageKind: string;
+    entityPrompts?: Record<string, string>;
+    author?: QuickyConfig["author"];
+  },
 ): Promise<ExtractedClaim[]> {
   if (content.length > 12000) {
     return extractClaimsChunked(llm, content, title, source, ctx);
@@ -231,7 +299,11 @@ async function extractClaimsChunked(
   content: string,
   title: string,
   source: Source,
-  ctx: { pageKind: string; entityPrompts?: Record<string, string> },
+  ctx: {
+    pageKind: string;
+    entityPrompts?: Record<string, string>;
+    author?: QuickyConfig["author"];
+  },
 ): Promise<ExtractedClaim[]> {
   const chunkSize = 8000;
   const overlap = 500;
@@ -263,19 +335,24 @@ async function extractClaimsSingle(
   content: string,
   title: string,
   source: Source,
-  ctx: { pageKind: string; entityPrompts?: Record<string, string> },
+  ctx: {
+    pageKind: string;
+    entityPrompts?: Record<string, string>;
+    author?: QuickyConfig["author"];
+  },
 ): Promise<ExtractedClaim[]> {
   const entityExtra = ctx.entityPrompts?.[ctx.pageKind]?.trim();
   const extra = entityExtra
     ? `\n\nAdditional instructions for this entity kind (${ctx.pageKind}):\n${entityExtra}`
     : "";
+  const authorExtra = authorPromptExtra(ctx.author);
 
   const systemPrompt = `You extract atomic, verifiable claims from source material.
 Each claim should be a single factual statement. Be precise and specific.
 Assign an initial confidence based on how well-supported the claim is by the source.
 Tag each claim with relevant topic tags.
 Identify related concepts (potential wiki page titles) for cross-linking.
-If a claim logically depends on another claim you're extracting, note the dependency.${extra}
+If a claim logically depends on another claim you're extracting, note the dependency.${authorExtra}${extra}
 
 Respond in JSON format:
 {
@@ -322,20 +399,54 @@ Respond in JSON format:
   }
 }
 
+/** Vault / entity document types: stored as markdown sources but not valid SourceType values. */
+const ENTITY_DOC_TYPES = new Set([
+  "person",
+  "relationship",
+  "project",
+  "daily_review",
+  "weekly_review",
+  "focus",
+  "life_area",
+  "review",
+]);
+
+const SOURCE_TYPES: ReadonlySet<string> = new Set<SourceType>([
+  "article",
+  "paper",
+  "repo",
+  "dataset",
+  "image",
+  "note",
+  "book",
+  "video",
+  "conversation",
+  "chat",
+  "other",
+]);
+
 function inferSourceType(
   filePath: string,
   frontmatter: Record<string, unknown>,
 ): SourceType {
-  if (frontmatter.type) return frontmatter.type as SourceType;
+  const st = frontmatter.sourceType;
+  if (st === "chat" || st === "conversation") return st as SourceType;
+  const fmType = frontmatter.type != null ? String(frontmatter.type) : "";
+  if (fmType === "chat" || fmType === "conversation") return fmType as SourceType;
+  if (fmType && ENTITY_DOC_TYPES.has(fmType)) return "note";
+  if (fmType && SOURCE_TYPES.has(fmType)) return fmType as SourceType;
   const ext = extname(filePath).toLowerCase();
   if ([".pdf"].includes(ext)) return "paper";
   if ([".md", ".mdx", ".txt"].includes(ext)) return "note";
   return "other";
 }
 
-function inferQuality(frontmatter: Record<string, unknown>): QualityTier {
+function inferQuality(
+  frontmatter: Record<string, unknown>,
+  config?: QuickyConfig,
+): QualityTier {
   if (frontmatter.quality) return frontmatter.quality as QualityTier;
   if (frontmatter.doi || frontmatter.arxiv) return "peer-reviewed";
   if (frontmatter.publisher) return "book";
-  return "unknown";
+  return config?.defaultQualityTier ?? "unknown";
 }

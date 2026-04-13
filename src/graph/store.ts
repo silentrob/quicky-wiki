@@ -1059,6 +1059,31 @@ export class KnowledgeStore {
     return emptyPages.length;
   }
 
+  /**
+   * Remove topic pages with no claims (LLM stubs / related-concept shells).
+   * Does not delete typed entity pages (person, project, relationship, etc.).
+   */
+  deleteEmptyTopicPages(): number {
+    const emptyTopics = this.db
+      .prepare(
+        `SELECT p.id FROM pages p
+         LEFT JOIN claims c ON c.page_id = p.id
+         WHERE p.kind = 'topic'
+         GROUP BY p.id
+         HAVING COUNT(c.id) = 0`,
+      )
+      .all() as any[];
+    for (const row of emptyTopics) {
+      this.db
+        .prepare(
+          "DELETE FROM page_links WHERE from_page_id = ? OR to_page_id = ?",
+        )
+        .run(row.id, row.id);
+      this.db.prepare("DELETE FROM pages WHERE id = ?").run(row.id);
+    }
+    return emptyTopics.length;
+  }
+
   // ---- Row mappers ----
 
   private rowToSource(row: any): Source {
