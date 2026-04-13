@@ -2,12 +2,16 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import type { KnowledgeStore } from "../graph/store.js";
 import type { QuickyConfig, LLMAdapter } from "../types.js";
 import { generateHealthReport } from "../metabolism/health.js";
 import { renderGraphData } from "../render/graph-viz.js";
 import { queryKnowledge } from "../graph/query.js";
 import { renderAllPages } from "../render/markdown.js";
+
+const _require = createRequire(import.meta.url);
+const APP_VERSION: string = _require("../../package.json").version;
 
 // Simple TTL cache — single user, invalidate on writes
 class TTLCache {
@@ -114,6 +118,18 @@ export function startDashboard(
           }));
           cache.set("claims", data, 10000);
           json(res, data);
+        } else if (url.pathname === "/api/source") {
+          const id = url.searchParams.get("id");
+          if (!id) {
+            json(res, { error: "Missing id" }, 400);
+            return;
+          }
+          const result = store.getSourceWithClaims(id);
+          if (!result) {
+            json(res, { error: "Not found" }, 404);
+            return;
+          }
+          json(res, result);
         } else if (url.pathname === "/api/sources") {
           json(res, store.listSources());
         } else if (url.pathname === "/api/graph") {
@@ -256,7 +272,7 @@ export function startDashboard(
           json(res, { success: true, pruned });
         } else {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(dashboardHTML(config.name));
+          res.end(dashboardHTML(config.name, APP_VERSION));
         }
       } catch {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -299,7 +315,7 @@ function esc(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function dashboardHTML(wikiName: string): string {
+function dashboardHTML(wikiName: string, version: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -591,7 +607,7 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
   <div class="slideOver-body" id="slideOver-body"></div>
 </div>
 <script>
-let DATA={};let searchDebounce=null;const chatHistory=[];
+let DATA={};let searchDebounce=null;const chatHistory=[];const APP_VERSION='${esc(version)}';
 async function fetchAll(){
   const[stats,pages,claims,sources,graph,health,events]=await Promise.all([
     fetch('/api/stats').then(r=>r.json()),fetch('/api/pages').then(r=>r.json()),
@@ -713,6 +729,35 @@ async function openPage(pageId){
   document.getElementById('delete-page-btn').addEventListener('click',async()=>{if(!confirm('Delete page "'+page.title+'" and all its claims?'))return;await fetch('/api/page?id='+page.id,{method:'DELETE'});await refreshData();closeSlideOver();renderPages();});
 }
 
+async function openSource(sourceId){
+  const data=await fetch('/api/source?id='+sourceId).then(r=>r.json());
+  if(data.error)return;
+  const src=data.source;const claims=data.claims;
+  let html='<div class="slideOver-section"><h3>Details</h3><div style="display:flex;flex-direction:column;gap:6px;font-size:13px">';
+  html+='<div style="display:flex;justify-content:space-between"><span style="color:var(--text-dim)">Type</span><span>'+esc(src.type)+'</span></div>';
+  html+='<div style="display:flex;justify-content:space-between"><span style="color:var(--text-dim)">Quality</span><span class="badge badge-accent">'+esc(src.qualityTier)+'</span></div>';
+  html+='<div style="display:flex;justify-content:space-between"><span style="color:var(--text-dim)">Ingested</span><span>'+new Date(src.ingestedAt).toLocaleString()+'</span></div>';
+  html+='<div style="display:flex;justify-content:space-between"><span style="color:var(--text-dim)">Path</span><span style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:right" title="'+esc(src.path)+'">'+esc(src.path)+'</span></div>';
+  html+='</div></div>';
+  if(claims.length){
+    const pages=[...new Map(claims.map(c=>[c.pageId,c.pageTitle])).entries()];
+    html+='<div class="slideOver-section"><h3>Pages ('+pages.length+')</h3><div>';
+    html+=pages.map(([id,title])=>'<span class="linked-page-chip" data-page-id="'+id+'">'+esc(title)+'</span>').join('');
+    html+='</div></div>';
+    html+='<div class="slideOver-section"><h3>Claims ('+claims.length+')</h3>';
+    html+=claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+'<div style="flex:1"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px"><span class="page-link" data-page-id="'+c.pageId+'" style="cursor:pointer">'+esc(c.pageTitle)+'</span> · '+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div></div>').join('');
+    html+='</div>';
+  }else{
+    html+='<div class="slideOver-section"><p style="font-size:13px;color:var(--text-dim)">No claims linked to this source.</p></div>';
+  }
+  const meta=src.metadata&&Object.keys(src.metadata).length?src.metadata:null;
+  if(meta){
+    html+='<div class="slideOver-section"><h3>Metadata</h3><pre style="font-size:11px;overflow:auto;max-height:220px;background:var(--surface2);padding:10px;border-radius:var(--radius-xs);border:1px solid var(--border)">'+esc(JSON.stringify(meta,null,2))+'</pre></div>';
+  }
+  openSlideOver(html,src.title);
+  document.getElementById('slideOver-body').querySelectorAll('.page-link[data-page-id]').forEach(el=>{el.addEventListener('click',()=>openPage(el.dataset.pageId));});
+}
+
 function confBadge(val){const pct=(val*100).toFixed(0)+'%';if(val>=0.8)return'<span class="badge badge-green">'+pct+'</span>';if(val>=0.4)return'<span class="badge badge-yellow">'+pct+'</span>';return'<span class="badge badge-red">'+pct+'</span>';}
 function relTime(iso){if(!iso)return'';const diff=Date.now()-new Date(iso).getTime();if(diff<3600000)return Math.floor(diff/60000)+'m ago';if(diff<86400000)return Math.floor(diff/3600000)+'h ago';return Math.floor(diff/86400000)+'d ago';}
 function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';}
@@ -773,7 +818,7 @@ function renderStatsRow(){
 function sCard(v,l,c){return'<div class="stat-card '+c+'"><div class="value">'+v+'</div><div class="label">'+l+'</div></div>';}
 function renderSidebarStats(){
   const{stats}=DATA;
-  document.getElementById('sidebar-stats').innerHTML='<div class="sidebar-stat"><span class="label">Sources</span><span class="val">'+stats.sources+'</span></div><div class="sidebar-stat"><span class="label">Pages</span><span class="val">'+stats.pages+'</span></div><div class="sidebar-stat"><span class="label">Claims</span><span class="val">'+stats.claims+'</span></div><div class="sidebar-stat"><span class="label">Events</span><span class="val">'+stats.events+'</span></div><div style="margin-top:10px;display:flex;flex-direction:column;gap:6px"><button id="prune-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--red)\\';this.style.color=\\'var(--red)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Empty Pages</button><button id="prune-topics-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--accent)\\';this.style.color=\\'var(--accent)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Topic Stubs</button></div>';
+  document.getElementById('sidebar-stats').innerHTML='<div class="sidebar-stat"><span class="label">Sources</span><span class="val">'+stats.sources+'</span></div><div class="sidebar-stat"><span class="label">Pages</span><span class="val">'+stats.pages+'</span></div><div class="sidebar-stat"><span class="label">Claims</span><span class="val">'+stats.claims+'</span></div><div class="sidebar-stat"><span class="label">Events</span><span class="val">'+stats.events+'</span></div><div style="margin-top:10px;display:flex;flex-direction:column;gap:6px"><button id="prune-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--red)\\';this.style.color=\\'var(--red)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Empty Pages</button><button id="prune-topics-btn" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xs);padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text-dim);transition:var(--transition)" onmouseover="this.style.borderColor=\\'var(--accent)\\';this.style.color=\\'var(--accent)\\'" onmouseout="this.style.borderColor=\\'var(--border)\\';this.style.color=\\'var(--text-dim)\\'">Prune Topic Stubs</button></div><div style="margin-top:10px;text-align:center;font-size:10px;color:var(--text-xdim);letter-spacing:.3px;opacity:.6">v'+APP_VERSION+'</div>';
   document.getElementById('prune-btn').addEventListener('click',async()=>{if(!confirm('Delete all pages with no claims?'))return;const r=await fetch('/api/prune',{method:'POST'}).then(r=>r.json());alert('Pruned '+r.pruned+' empty pages');await refreshData();});
   document.getElementById('prune-topics-btn').addEventListener('click',async()=>{if(!confirm('Delete topic pages (kind=topic) that have no claims? Typed entities are kept.'))return;const r=await fetch('/api/prune-topics',{method:'POST'}).then(x=>x.json());alert('Pruned '+r.pruned+' topic stubs; wiki re-rendered.');await refreshData();});
   document.getElementById('nav-claims-count').textContent=stats.claims;
@@ -790,7 +835,7 @@ function renderOverview(){
   health.suggestedActions.forEach(a=>items.push('💡 '+a));
   if(!items.length)items.push('✅ Knowledge base is healthy!');
   document.getElementById('attention-items').innerHTML=items.map(i=>'<div style="padding:5px 0;font-size:13px">'+i+'</div>').join('');
-  document.getElementById('sources-list').innerHTML=sources.length===0?'<p style="color:var(--text-dim)">No sources yet.</p>':'<table><tbody>'+sources.map(s=>'<tr><td style="color:var(--accent)">'+esc(s.title)+'</td><td><span class="badge badge-accent">'+s.qualityTier+'</span></td><td style="color:var(--text-dim)">'+relTime(s.ingestedAt)+'</td></tr>').join('')+'</tbody></table>';
+  document.getElementById('sources-list').innerHTML=sources.length===0?'<p style="color:var(--text-dim)">No sources yet.</p>':'<table><tbody>'+sources.map(s=>'<tr data-source-id="'+s.id+'" style="cursor:pointer"><td style="color:var(--accent)">'+esc(s.title)+'</td><td><span class="badge badge-accent">'+s.qualityTier+'</span></td><td style="color:var(--text-dim)">'+relTime(s.ingestedAt)+'</td></tr>').join('')+'</tbody></table>';
   const recent=events.slice(0,5);
   document.getElementById('recent-events').innerHTML=recent.length===0?'<p style="color:var(--text-dim)">No events yet.</p>':recent.map(e=>'<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px"><span style="font-weight:600;text-transform:capitalize;min-width:70px">'+e.type+'</span><span style="flex:1;color:var(--text-dim)">'+esc(e.claimStatement.slice(0,50))+'</span><span style="color:'+(e.confidenceAfter>=e.confidenceBefore?'var(--green)':'var(--red)')+';font-size:12px">'+(e.confidenceBefore*100).toFixed(0)+'%→'+(e.confidenceAfter*100).toFixed(0)+'%</span></div>').join('');
   renderConfChart();
@@ -846,7 +891,7 @@ function applyPageFilter(){
   document.getElementById('pages-table').innerHTML=html;
 }
 document.getElementById('page-search').addEventListener('input',applyPageFilter);
-document.addEventListener('click',e=>{const row=e.target.closest('tr[data-page-id]');if(row)openPage(row.dataset.pageId);});
+document.addEventListener('click',e=>{const srow=e.target.closest('tr[data-source-id]');if(srow){openSource(srow.dataset.sourceId);return;}const row=e.target.closest('tr[data-page-id]');if(row)openPage(row.dataset.pageId);});
 
 function renderTimeline(){
   const{events}=DATA;

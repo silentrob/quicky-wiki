@@ -299,6 +299,15 @@ export class KnowledgeStore {
       getClaimPageId: this.db.prepare(
         "SELECT page_id FROM claims WHERE id = ?",
       ),
+      claimsBySource: this.db.prepare(`
+        SELECT c.*, p.title as page_title,
+          (SELECT COUNT(*) FROM claim_sources cs2 WHERE cs2.claim_id = c.id) as source_count
+        FROM claim_sources cs
+        JOIN claims c ON c.id = cs.claim_id
+        JOIN pages p ON p.id = c.page_id
+        WHERE cs.source_id = ?
+        ORDER BY c.confidence DESC
+      `),
       pagesWithoutSummary: this.db.prepare(
         "SELECT id FROM pages WHERE summary = ''",
       ),
@@ -369,6 +378,33 @@ export class KnowledgeStore {
     return (this.stmts.allSources.all() as any[]).map((r) =>
       this.rowToSource(r),
     );
+  }
+
+  getSourceWithClaims(id: string): {
+    source: Source;
+    claims: {
+      id: string;
+      statement: string;
+      confidence: number;
+      pageId: string;
+      pageTitle: string;
+      sources: number;
+      lastReinforced: string;
+    }[];
+  } | null {
+    const source = this.getSource(id);
+    if (!source) return null;
+    const rows = this.stmts.claimsBySource.all(id) as any[];
+    const claims = rows.map((r) => ({
+      id: r.id,
+      statement: r.statement,
+      confidence: r.confidence,
+      pageId: r.page_id,
+      pageTitle: r.page_title,
+      sources: r.source_count,
+      lastReinforced: r.last_reinforced,
+    }));
+    return { source, claims };
   }
 
   // ---- Pages ----
