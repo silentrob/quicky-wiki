@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { basename, extname } from "node:path";
 import matter from "gray-matter";
 import type { KnowledgeStore } from "../graph/store.js";
+import { ENTITY_PAGE_KINDS } from "../graph/store.js";
 import type {
   LLMAdapter,
   Source,
@@ -10,7 +11,9 @@ import type {
   QualityTier,
   KnowledgeDiff,
   QuickyConfig,
+  ClaimType,
 } from "../types.js";
+import { normalizeClaimType } from "../types.js";
 import { scoreConfidence } from "./confidence.js";
 import { computeKnowledgeDiff } from "./diff.js";
 import { resolveKnowledge } from "./resolve.js";
@@ -29,6 +32,9 @@ export type IngestSourceOptions = {
   /** Merge into page metadata_json (e.g. MCP override) */
   metadata?: Record<string, unknown>;
 };
+
+/** Diff plus optional pipeline stats returned after `resolveKnowledge`. */
+export type IngestResult = KnowledgeDiff & { relationsCompiled?: number };
 
 /**
  * First matching kindRules entry wins. Rules use path substring match, or
@@ -142,26 +148,30 @@ function syncPrimaryPageEntity(
   if (!page) {
     const path = titleToWikiPath(pageTitle);
     try {
-      store.addPage(pageTitle, path, "", kind, metadata);
+      const p = store.addPage(pageTitle, path, "", kind, metadata);
+      store.syncEntityWithPrimaryPage(p.id);
     } catch {
       const byPath = store.listPages().find((p) => p.path === path);
       if (byPath) {
         store.updatePageKind(byPath.id, kind);
         store.updatePageMetadata(byPath.id, metadata);
+        store.syncEntityWithPrimaryPage(byPath.id);
       } else {
-        store.addPage(
+        const p = store.addPage(
           pageTitle,
           path.replace(".md", `-${Date.now()}.md`),
           "",
           kind,
           metadata,
         );
+        store.syncEntityWithPrimaryPage(p.id);
       }
     }
     return;
   }
   store.updatePageKind(page.id, kind);
   store.updatePageMetadata(page.id, metadata);
+  store.syncEntityWithPrimaryPage(page.id);
 }
 
 export async function ingestSource(
@@ -169,7 +179,7 @@ export async function ingestSource(
   llm: LLMAdapter,
   filePath: string,
   opts?: IngestSourceOptions,
-): Promise<KnowledgeDiff> {
+): Promise<IngestResult> {
   const progress = opts?.onProgress ?? (() => {});
   const raw = await readFile(filePath, "utf-8");
   const contentHash = createHash("sha256").update(raw).digest("hex");
@@ -238,12 +248,13 @@ export async function ingestSource(
   };
 
   progress("extracting", `Extracting claims from "${title}"...`);
-  const extractedClaims = await extractClaims(
+  const { claims: extractedClaims, entityMetadata } = await extractClaims(
     llm,
     content,
     title,
     source,
     extractCtx,
+    store,
   );
   progress("extracted", `Found ${extractedClaims.length} claims`);
 
@@ -255,26 +266,75 @@ export async function ingestSource(
   );
 
   progress("resolving", `Resolving knowledge graph...`);
-  await resolveKnowledge(store, llm, diff, source);
+  const { relationsCompiled } = await resolveKnowledge(
+    store,
+    llm,
+    diff,
+    source,
+    opts?.config,
+  );
   progress("done", `Ingestion complete`);
 
   syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
 
-  return diff;
+  if (
+    entityMetadata &&
+    Object.keys(entityMetadata).length > 0 &&
+    ENTITY_PAGE_KINDS.has(resolvedKind)
+  ) {
+    const page = store.getPageByTitle(primaryPageTitle);
+    if (page?.entityId) {
+      store.mergeEntityMetadata(page.entityId, entityMetadata, source.id);
+    }
+  }
+
+  return { ...diff, relationsCompiled };
 }
 
 interface ExtractedClaim {
   statement: string;
   confidence: number;
+  claimType: ClaimType;
   tags: string[];
   relatedConcepts: string[];
   dependsOnStatements: string[];
+}
+
+function entityMetadataSchemaHint(kind: string): string {
+  switch (kind) {
+    case "person":
+      return `Use "entity_metadata" with: roles (string[]), organizations (string[]), relationship_type (string), importance (string), cadence (string), last_contact (string|null), active_topics (string[]), notable_dates (object of string keys to ISO date strings). Omit keys you cannot infer.`;
+    case "project":
+      return `Use "entity_metadata" with: status (string), priority (string), mode (string), stakeholders (string[]), dependencies (string[]), milestones (array of {name, status, date?}). Omit keys you cannot infer.`;
+    case "organization":
+    case "place":
+    case "life_area":
+    case "relationship":
+      return `Use "entity_metadata" with flat string or string[] fields that describe this ${kind} usefully (e.g. region, sector, notes).`;
+    default:
+      return "";
+  }
 }
 
 function authorPromptExtra(author?: QuickyConfig["author"]): string {
   if (!author?.name?.trim()) return "";
   const ctx = author.context?.trim();
   return `\n\nThe knowledge base belongs to ${author.name.trim()}.${ctx ? ` ${ctx}` : ""} When extracting claims, refer to this person by name ("${author.name.trim()}") instead of vague phrases like "the author", "the user", or "I" (unless the source is a direct first-person quote).`;
+}
+
+type ExtractClaimsResult = {
+  claims: ExtractedClaim[];
+  entityMetadata?: Record<string, unknown>;
+};
+
+function formatEntityCatalog(store: KnowledgeStore): string {
+  const lines: string[] = [];
+  for (const e of store.listEntities()) {
+    lines.push(`- ${e.canonicalName} (${e.type}) [id:${e.id}]`);
+  }
+  return lines.length
+    ? lines.join("\n")
+    : "(no entities in graph yet — use natural names; new pages may be created)";
 }
 
 async function extractClaims(
@@ -287,11 +347,12 @@ async function extractClaims(
     entityPrompts?: Record<string, string>;
     author?: QuickyConfig["author"];
   },
-): Promise<ExtractedClaim[]> {
+  store: KnowledgeStore,
+): Promise<ExtractClaimsResult> {
   if (content.length > 12000) {
-    return extractClaimsChunked(llm, content, title, source, ctx);
+    return extractClaimsChunked(llm, content, title, source, ctx, store);
   }
-  return extractClaimsSingle(llm, content, title, source, ctx);
+  return extractClaimsSingle(llm, content, title, source, ctx, store);
 }
 
 async function extractClaimsChunked(
@@ -304,7 +365,8 @@ async function extractClaimsChunked(
     entityPrompts?: Record<string, string>;
     author?: QuickyConfig["author"];
   },
-): Promise<ExtractedClaim[]> {
+  store: KnowledgeStore,
+): Promise<ExtractClaimsResult> {
   const chunkSize = 8000;
   const overlap = 500;
   const chunks: string[] = [];
@@ -313,13 +375,24 @@ async function extractClaimsChunked(
   }
 
   const allClaims: ExtractedClaim[] = [];
+  let mergedMeta: Record<string, unknown> | undefined;
   for (const chunk of chunks) {
-    const claims = await extractClaimsSingle(llm, chunk, title, source, ctx);
+    const { claims, entityMetadata } = await extractClaimsSingle(
+      llm,
+      chunk,
+      title,
+      source,
+      ctx,
+      store,
+    );
     allClaims.push(...claims);
+    if (entityMetadata && Object.keys(entityMetadata).length > 0) {
+      mergedMeta = { ...mergedMeta, ...entityMetadata };
+    }
   }
 
   const seen = new Set<string>();
-  return allClaims.filter((c) => {
+  const deduped = allClaims.filter((c) => {
     const key = c.statement
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "")
@@ -328,6 +401,7 @@ async function extractClaimsChunked(
     seen.add(key);
     return true;
   });
+  return { claims: deduped, entityMetadata: mergedMeta };
 }
 
 async function extractClaimsSingle(
@@ -340,19 +414,30 @@ async function extractClaimsSingle(
     entityPrompts?: Record<string, string>;
     author?: QuickyConfig["author"];
   },
-): Promise<ExtractedClaim[]> {
+  store: KnowledgeStore,
+): Promise<ExtractClaimsResult> {
   const entityExtra = ctx.entityPrompts?.[ctx.pageKind]?.trim();
   const extra = entityExtra
     ? `\n\nAdditional instructions for this entity kind (${ctx.pageKind}):\n${entityExtra}`
     : "";
   const authorExtra = authorPromptExtra(ctx.author);
+  const metaHint = ENTITY_PAGE_KINDS.has(ctx.pageKind)
+    ? `\n\nAlso extract structured fields for this primary entity (${ctx.pageKind}):\n${entityMetadataSchemaHint(ctx.pageKind)}\nInclude a top-level JSON key "entity_metadata" (object). Use canonical entity names from the catalog when referring to people/projects.\n\nKnown entities catalog:\n${formatEntityCatalog(store)}\n\nIf a surface form might be an alias of an existing entity but you are not certain, add "possible_alias": { "surface": "...", "candidate_entity_name": "..." } at the top level (optional, may omit).`
+    : "";
 
   const systemPrompt = `You extract atomic, verifiable claims from source material.
 Each claim should be a single factual statement. Be precise and specific.
 Assign an initial confidence based on how well-supported the claim is by the source.
+For each claim, set claim_type to exactly one of: fact, observation, preference, hypothesis, status, attribute.
+  - fact: durable biographical or world fact
+  - observation: something noticed, time-bound
+  - preference: declared taste or value
+  - hypothesis: inferred pattern, testable
+  - status: current state of something
+  - attribute: structured entity property (roles, dates, relationship labels)
 Tag each claim with relevant topic tags.
 Identify related concepts (potential wiki page titles) for cross-linking.
-If a claim logically depends on another claim you're extracting, note the dependency.${authorExtra}${extra}
+If a claim logically depends on another claim you're extracting, note the dependency.${authorExtra}${extra}${metaHint}
 
 Respond in JSON format:
 {
@@ -360,11 +445,14 @@ Respond in JSON format:
     {
       "statement": "Precise factual claim",
       "confidence": 0.85,
+      "claim_type": "fact",
       "tags": ["topic1", "topic2"],
       "relatedConcepts": ["Concept A", "Concept B"],
       "dependsOnStatements": []
     }
-  ]
+  ],
+  "entity_metadata": {},
+  "possible_alias": null
 }`;
 
   const response = await llm.chat(
@@ -383,19 +471,47 @@ Respond in JSON format:
 
   try {
     const parsed = parseLLMJson(response.content);
-    return (parsed.claims ?? []).map((c: any) => ({
+    const claims = (parsed.claims ?? []).map((c: any) => ({
       statement: c.statement,
       confidence: scoreConfidence(c.confidence, source.qualityTier),
+      claimType: normalizeClaimType(c.claim_type ?? c.claimType),
       tags: c.tags ?? [],
       relatedConcepts: c.relatedConcepts ?? [],
       dependsOnStatements: c.dependsOnStatements ?? [],
     }));
+    const rawMeta = parsed.entity_metadata;
+    const entityMetadata =
+      rawMeta &&
+      typeof rawMeta === "object" &&
+      !Array.isArray(rawMeta) &&
+      ENTITY_PAGE_KINDS.has(ctx.pageKind)
+        ? (rawMeta as Record<string, unknown>)
+        : undefined;
+    const pa = parsed.possible_alias;
+    if (
+      pa &&
+      typeof pa === "object" &&
+      pa.surface &&
+      pa.candidate_entity_name &&
+      source.id
+    ) {
+      try {
+        store.addPendingAlias({
+          surfaceForm: String(pa.surface),
+          candidateEntityName: String(pa.candidate_entity_name),
+          sourceId: source.id,
+        });
+      } catch {
+        /* optional */
+      }
+    }
+    return { claims, entityMetadata };
   } catch (err) {
     console.error(
       `[extractClaims] JSON parse failed: ${err}`,
       response.content.slice(0, 300),
     );
-    return [];
+    return { claims: [] };
   }
 }
 

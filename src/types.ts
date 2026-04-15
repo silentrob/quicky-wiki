@@ -36,6 +36,24 @@ export interface Source {
 }
 
 // --- Claim ---
+export const CLAIM_TYPES = [
+  "fact",
+  "observation",
+  "preference",
+  "hypothesis",
+  "status",
+  "attribute",
+] as const;
+export type ClaimType = (typeof CLAIM_TYPES)[number];
+
+export function normalizeClaimType(v: unknown): ClaimType {
+  const s = String(v ?? "")
+    .toLowerCase()
+    .trim();
+  if ((CLAIM_TYPES as readonly string[]).includes(s)) return s as ClaimType;
+  return "fact";
+}
+
 export type EpistemicEventType =
   | "created"
   | "reinforced"
@@ -60,6 +78,7 @@ export interface Claim {
   statement: string;
   pageId: string;
   confidence: number; // 0.0 - 1.0
+  claimType: ClaimType;
   sources: string[]; // source IDs
   firstStated: string; // ISO date
   lastReinforced: string; // ISO date
@@ -71,6 +90,61 @@ export interface Claim {
   timeline: EpistemicEvent[];
 }
 
+// --- Relations (typed edges between entities) ---
+export interface KnowledgeRelation {
+  id: string;
+  fromEntityId: string;
+  relationType: string;
+  toEntityId: string;
+  confidence: number;
+  status: string;
+  validFrom: string | null;
+  validTo: string | null;
+  sourceClaimId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --- Entity (first-class ontology) ---
+export interface Entity {
+  id: string;
+  type: string;
+  canonicalName: string;
+  status: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** LLM-compiled slices stored per entity (see `compiled_views` table). */
+export const COMPILED_VIEW_TYPES = [
+  "summary",
+  "agent_context",
+  "status_card",
+  "briefing",
+] as const;
+export type CompiledViewType = (typeof COMPILED_VIEW_TYPES)[number];
+
+export interface CompiledView {
+  id: string;
+  entityId: string;
+  viewType: CompiledViewType;
+  body: string;
+  stale: boolean;
+  updatedAt: string;
+}
+
+export interface EntityStateChange {
+  id: string;
+  entityId: string;
+  fieldPath: string;
+  oldValue: unknown;
+  newValue: unknown;
+  sourceId: string | null;
+  createdAt: string;
+}
+
 // --- Wiki Page ---
 export interface WikiPage {
   id: string;
@@ -79,6 +153,8 @@ export interface WikiPage {
   summary: string;
   kind: string;
   metadata: Record<string, unknown>;
+  /** Primary wiki page for an entity, when linked. */
+  entityId: string | null;
   claims: string[]; // claim IDs
   linksTo: string[]; // page IDs
   linkedFrom: string[]; // page IDs
@@ -114,6 +190,7 @@ export interface KnowledgeDiff {
     statement: string;
     confidence: number;
     tags?: string[];
+    claimType?: ClaimType;
   }>;
   gapsIdentified: Array<{
     concept: string;
@@ -147,6 +224,14 @@ export interface HealthReport {
   }>;
   gaps: Array<{ concept: string; references: number }>;
   suggestedActions: string[];
+  /** Entity / relation coverage (Phase 4 health). */
+  ontology?: {
+    entityCount: number;
+    entitiesWithPrimaryPage: number;
+    relationCount: number;
+    pendingAliasCount: number;
+    staleCompiledViewCount: number;
+  };
 }
 
 // --- LLM ---
@@ -234,6 +319,17 @@ export interface QuickyConfig {
    * `frontmatter.name` → `frontmatter.title` → source stem.
    */
   primaryPageTitleRules?: PrimaryPageTitleRule[];
+  /** Optional hybrid FTS + vector retrieval (SQLite-stored embeddings). */
+  retrieval?: {
+    embeddingModel?: string;
+    /** When true, search/query use embeddings if an OpenAI API key is available. */
+    hybridSearch?: boolean;
+    wFts?: number;
+    wVec?: number;
+    wConf?: number;
+    wRec?: number;
+    wType?: number;
+  };
 }
 
 export const DEFAULT_CONFIG: QuickyConfig = {

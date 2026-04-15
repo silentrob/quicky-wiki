@@ -1,4 +1,5 @@
 import type { KnowledgeStore } from "../graph/store.js";
+import { ENTITY_PAGE_KINDS } from "../graph/store.js";
 
 export function renderGraphData(store: KnowledgeStore): {
   nodes: GraphNode[];
@@ -20,6 +21,11 @@ export function renderGraphData(store: KnowledgeStore): {
     );
   }
 
+  const entityIdToPageId = new Map<string, string>();
+  for (const page of pages) {
+    if (page.entityId) entityIdToPageId.set(page.entityId, page.id);
+  }
+
   // Page nodes
   for (const page of pages) {
     const count = claimCountByPage.get(page.id) || 0;
@@ -27,13 +33,21 @@ export function renderGraphData(store: KnowledgeStore): {
     const avgConf = pageClaims.length
       ? pageClaims.reduce((s, c) => s + c.confidence, 0) / pageClaims.length
       : 0;
+    const isEntity = !!page.entityId && ENTITY_PAGE_KINDS.has(page.kind);
+    const baseSize = count <= 1 ? 8 : Math.min(40, 8 + Math.log2(count) * 8);
     nodes.push({
       id: page.id,
       label: page.title,
       type: "page",
-      size: count <= 1 ? 8 : Math.min(40, 8 + Math.log2(count) * 8),
-      color: confidenceColor(avgConf),
-      metadata: { claims: count, avgConfidence: avgConf },
+      size: isEntity ? baseSize + 4 : baseSize,
+      color: isEntity ? entityKindColor(page.kind) : confidenceColor(avgConf),
+      metadata: {
+        claims: count,
+        avgConfidence: avgConf,
+        pageKind: page.kind,
+        isEntity,
+        entityId: page.entityId,
+      },
     });
   }
 
@@ -73,6 +87,27 @@ export function renderGraphData(store: KnowledgeStore): {
     if (pageIds.size >= 2) {
       sourceGroups[srcId] = [...pageIds];
     }
+  }
+
+  // Typed entity relations → edges between primary pages
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  for (const rel of store.listRelations()) {
+    const fromPage = entityIdToPageId.get(rel.fromEntityId);
+    const toPage = entityIdToPageId.get(rel.toEntityId);
+    if (!fromPage || !toPage || fromPage === toPage) continue;
+    if (!nodeIds.has(fromPage) || !nodeIds.has(toPage)) continue;
+    const key = `${fromPage}→${toPage}|rel|${rel.id}`;
+    if (edgeSet.has(key)) continue;
+    edgeSet.add(key);
+    const imp = 550 + Math.round(rel.confidence * 50);
+    edges.push({
+      source: fromPage,
+      target: toPage,
+      type: "relation",
+      weight: 1.5,
+      importance: imp,
+      relationType: rel.relationType,
+    });
   }
 
   // Claim contradiction edges (always important — keep all)
@@ -171,6 +206,25 @@ function confidenceColor(confidence: number): string {
   return "#f87171"; /* soft rose */
 }
 
+function entityKindColor(kind: string): string {
+  switch (kind) {
+    case "person":
+      return "#818cf8";
+    case "project":
+      return "#34d399";
+    case "organization":
+      return "#fbbf24";
+    case "place":
+      return "#2dd4bf";
+    case "life_area":
+      return "#c084fc";
+    case "relationship":
+      return "#f472b6";
+    default:
+      return "#94a3b8";
+  }
+}
+
 interface GraphNode {
   id: string;
   label: string;
@@ -183,7 +237,8 @@ interface GraphNode {
 interface GraphEdge {
   source: string;
   target: string;
-  type: "link" | "dependency" | "contradiction" | "shared-source";
+  type: "link" | "dependency" | "contradiction" | "shared-source" | "relation";
   weight: number;
   importance?: number;
+  relationType?: string;
 }

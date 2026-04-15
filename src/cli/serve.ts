@@ -1,17 +1,21 @@
 import { createServer } from "node:http";
+import { readFileSync, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { KnowledgeStore } from "../graph/store.js";
-import type { QuickyConfig, LLMAdapter } from "../types.js";
+import type { QuickyConfig, LLMAdapter, CompiledViewType } from "../types.js";
+import { COMPILED_VIEW_TYPES } from "../types.js";
 import { generateHealthReport } from "../metabolism/health.js";
 import { renderGraphData } from "../render/graph-viz.js";
 import { queryKnowledge } from "../graph/query.js";
 import { renderAllPages } from "../render/markdown.js";
 
-const _require = createRequire(import.meta.url);
-const APP_VERSION: string = _require("../../package.json").version;
+/** Resolved from dist/cli.js → ../package.json (must stay valid when bundled). */
+const APP_VERSION: string = (() => {
+  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  return (JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string }).version;
+})();
 
 // Simple TTL cache — single user, invalidate on writes
 class TTLCache {
@@ -70,6 +74,146 @@ export function startDashboard(
           const data = store.listPagesFlat();
           cache.set("pages", data, 10000);
           json(res, data);
+        } else if (url.pathname === "/api/entities") {
+          const cached = cache.get("entities");
+          if (cached) {
+            json(res, cached);
+            return;
+          }
+          const rows = store.listEntitiesWithStats();
+          const data = rows.map((e) => ({
+            id: e.id,
+            type: e.type,
+            canonicalName: e.canonicalName,
+            status: e.status,
+            metadata: e.metadata,
+            aliasCount: e.aliasCount,
+            claimCount: e.claimCount,
+            relationCount: e.relationCount,
+            primaryPageId: e.primaryPageId,
+          }));
+          cache.set("entities", data, 10000);
+          json(res, data);
+        } else if (url.pathname === "/api/entity") {
+          const id = url.searchParams.get("id");
+          if (!id) {
+            json(res, { error: "Missing id" }, 400);
+            return;
+          }
+          const detail = store.getEntityDetail(id);
+          if (!detail) {
+            json(res, { error: "Not found" }, 404);
+            return;
+          }
+          json(res, {
+            entity: {
+              id: detail.entity.id,
+              type: detail.entity.type,
+              canonicalName: detail.entity.canonicalName,
+              status: detail.entity.status,
+              metadata: detail.entity.metadata,
+            },
+            aliases: detail.aliases,
+            primaryPageId: detail.primaryPage?.id ?? null,
+            primaryPageTitle: detail.primaryPage?.title ?? null,
+            claims: detail.claims.map((c) => ({
+              id: c.id,
+              statement: c.statement,
+              confidence: c.confidence,
+              claimType: c.claimType,
+              lastReinforced: c.lastReinforced,
+            })),
+            relations: detail.relations,
+          });
+        } else if (url.pathname === "/api/review-queue") {
+          if (req.method === "GET") {
+            json(res, { items: store.listPendingAliases() });
+            return;
+          }
+          if (req.method === "POST") {
+            const body = await readBody(req);
+            const { action, id } = JSON.parse(body) as {
+              action?: string;
+              id?: string;
+            };
+            if (!id || !action) {
+              json(res, { error: "id and action required" }, 400);
+              return;
+            }
+            if (action === "confirm") {
+              const ok = store.confirmPendingAlias(id);
+              cache.invalidate();
+              json(res, { success: ok });
+              return;
+            }
+            if (action === "dismiss") {
+              store.dismissPendingAlias(id);
+              cache.invalidate();
+              json(res, { success: true });
+              return;
+            }
+            json(res, { error: "action must be confirm or dismiss" }, 400);
+            return;
+          }
+        } else if (url.pathname === "/api/entity-state") {
+          const entityId = url.searchParams.get("entity_id");
+          json(
+            res,
+            entityId
+              ? store.listEntityStateLog(entityId, 300)
+              : store.listRecentEntityStateLog(300),
+          );
+        } else if (url.pathname === "/api/compiled-view") {
+          const entityId = url.searchParams.get("entity_id");
+          const viewType = url.searchParams.get("view_type");
+          const force = url.searchParams.get("force") === "1";
+          if (!entityId || !viewType) {
+            json(res, { error: "entity_id and view_type required" }, 400);
+            return;
+          }
+          if (
+            !(COMPILED_VIEW_TYPES as readonly string[]).includes(viewType)
+          ) {
+            json(
+              res,
+              {
+                error: `view_type must be one of: ${COMPILED_VIEW_TYPES.join(", ")}`,
+              },
+              400,
+            );
+            return;
+          }
+          try {
+            const { ensureCompiledView } = await import(
+              "../compiler/views.js"
+            );
+            const body = await ensureCompiledView(
+              store,
+              llm,
+              entityId,
+              viewType as CompiledViewType,
+              { force },
+            );
+            const row = store.getCompiledView(
+              entityId,
+              viewType as CompiledViewType,
+            );
+            json(res, {
+              body,
+              stale: row?.stale ?? false,
+              updatedAt: row?.updatedAt ?? null,
+            });
+          } catch (e: any) {
+            json(res, { error: e?.message || "compile failed" }, 500);
+          }
+        } else if (url.pathname === "/api/relations") {
+          const entityId = url.searchParams.get("entity_id") ?? undefined;
+          json(
+            res,
+            store.listRelations(
+              entityId ? { entityId: entityId ?? undefined } : undefined,
+            ),
+          );
         } else if (url.pathname === "/api/page") {
           const id = url.searchParams.get("id");
           if (!id) {
@@ -94,7 +238,10 @@ export function startDashboard(
           }
           json(res, {
             ...full.page,
-            claims: full.claims,
+            claims: full.claims.map((c: any) => ({
+              ...c,
+              sources: c.sourceCount,
+            })),
             linkedPages,
             markdown,
           });
@@ -109,6 +256,7 @@ export function startDashboard(
             statement: c.statement,
             pageId: c.pageId,
             confidence: c.confidence,
+            claimType: c.claimType,
             sources: c.sourceCount,
             firstStated: c.firstStated,
             lastReinforced: c.lastReinforced,
@@ -163,7 +311,7 @@ export function startDashboard(
             return;
           }
           try {
-            const result = await queryKnowledge(store, llm, question);
+            const result = await queryKnowledge(store, llm, question, config);
             json(res, result);
           } catch (e: any) {
             json(
@@ -178,7 +326,7 @@ export function startDashboard(
         } else if (url.pathname === "/api/search") {
           const q = (url.searchParams.get("q") ?? "").toLowerCase();
           if (!q) {
-            json(res, { pages: [], claims: [] });
+            json(res, { pages: [], claims: [], relations: [] });
             return;
           }
           const searchCached = cache.get<any>(`search:${q}`);
@@ -186,8 +334,12 @@ export function startDashboard(
             json(res, searchCached);
             return;
           }
-          const { pages, claims } = store.search(q, 20);
-          const data = { pages, claims };
+          const data =
+            config.retrieval?.hybridSearch
+              ? await (
+                  await import("../embeddings/hybrid-search.js")
+                ).hybridSearch(store, q, 20, config)
+              : store.search(q, 20);
           cache.set(`search:${q}`, data, 60000);
           json(res, data);
         } else if (url.pathname === "/api/bookmark" && req.method === "POST") {
@@ -214,6 +366,7 @@ export function startDashboard(
               newClaims: diff.newClaims.length,
               reinforced: diff.reinforced.length,
               challenged: diff.challenged.length,
+              relationsCompiled: diff.relationsCompiled ?? 0,
             });
           } catch (e: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
@@ -369,7 +522,7 @@ header{grid-column:1/-1;background:rgba(255,255,255,.82);backdrop-filter:blur(16
 .search-result-item:last-child{border-bottom:none}
 .search-result-item:hover{background:var(--accent-light)}
 .sr-type{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
-.sr-page{background:var(--accent-dim);color:var(--accent)}.sr-claim{background:var(--purple-dim);color:var(--purple)}
+.sr-page{background:var(--accent-dim);color:var(--accent)}.sr-claim{background:var(--purple-dim);color:var(--purple)}.sr-entity{background:var(--green-dim,rgba(52,211,153,.15));color:var(--green,#34d399)}
 
 .sidebar-section{padding:14px 0}
 .sidebar-label{font-size:10px;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-xdim);padding:0 18px;margin-bottom:6px;font-weight:600}
@@ -461,6 +614,18 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
 .chat-send:hover{background:var(--accent-hover);box-shadow:var(--shadow-md)}.chat-send:disabled{opacity:.4;cursor:not-allowed}
 .chat-spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+.retrieval-debug{margin-top:8px}
+.retrieval-toggle{border:none;border-radius:10px;padding:3px 10px;font-size:10px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;cursor:pointer;transition:var(--transition);display:inline-flex;align-items:center;gap:5px}
+.retrieval-toggle .chevron{font-size:9px;opacity:.7;transition:transform .15s}
+.retrieval-toggle.open .chevron{transform:rotate(180deg)}
+.retrieval-toggle.fts5{background:var(--accent-dim);color:var(--accent)}
+.retrieval-toggle.fts5:hover{background:var(--accent);color:#fff}
+.retrieval-toggle.hybrid{background:var(--purple-dim);color:var(--purple)}
+.retrieval-toggle.hybrid:hover{background:var(--purple);color:#fff}
+.retrieval-toggle.warn{background:var(--yellow-dim);color:var(--yellow)}
+.retrieval-toggle.warn:hover{background:var(--yellow);color:#1e1e2e}
+.retrieval-detail{display:none;margin-top:6px;padding:8px 10px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);font-size:11px;color:var(--text-dim);line-height:1.7}
+.retrieval-detail.open{display:block}
 
 .tl-event{display:flex;gap:14px;padding:12px 0;border-bottom:1px solid var(--surface2);font-size:14px;align-items:flex-start}
 .tl-event:last-child{border-bottom:none}
@@ -507,7 +672,7 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
     <div class="logo"><span class="logo-icon">⚡</span>${esc(wikiName)}</div>
     <div class="search-wrapper">
       <span class="search-icon">🔍</span>
-      <input type="text" class="search-box" id="global-search" placeholder="Search pages, claims, concepts..." autocomplete="off">
+      <input type="text" class="search-box" id="global-search" placeholder="Search... try entity:person or claim:fact" autocomplete="off">
       <span class="search-kbd">⌘K</span>
       <div class="search-results" id="search-results"></div>
     </div>
@@ -520,8 +685,10 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
       <div class="nav-item" data-view="graph"><span class="nav-icon">🕸️</span>Graph</div>
       <div class="nav-item" data-view="claims"><span class="nav-icon">📋</span>Claims<span class="nav-badge" id="nav-claims-count">0</span></div>
       <div class="nav-item" data-view="pages"><span class="nav-icon">📄</span>Pages<span class="nav-badge" id="nav-pages-count">0</span></div>
+      <div class="nav-item" data-view="entities"><span class="nav-icon">🏷️</span>Entities<span class="nav-badge" id="nav-entities-count">0</span></div>
       <div class="nav-item" data-view="timeline"><span class="nav-icon">🕐</span>Timeline</div>
       <div class="nav-item" data-view="health"><span class="nav-icon">💊</span>Health</div>
+      <div class="nav-item" data-view="review"><span class="nav-icon">✅</span>Review<span class="nav-badge" id="nav-review-count">0</span></div>
     </div>
     <div class="sidebar-section">
       <div class="sidebar-label">Interact</div>
@@ -555,28 +722,45 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
             <div class="legend-item"><div class="legend-line" style="background:rgba(203,213,225,0.4)"></div>Explicit link</div>
             <div class="legend-item"><div class="legend-line" style="background:rgba(203,213,225,0.15)"></div>Shared source</div>
             <div class="legend-item"><div class="legend-line" style="background:#f87171"></div>Contradiction</div>
+            <div class="legend-item"><div class="legend-line" style="background:#34d399"></div>Relation (typed)</div>
+            <div class="legend-item"><div class="legend-line" style="background:#f472b6"></div>Family relation</div>
+            <div class="legend-item"><div class="legend-line" style="background:#38bdf8"></div>Dependency</div>
           </div>
         </div>
       </div>
     </div>
     <div id="view-claims" class="view">
-      <div style="display:flex;gap:10px;margin-bottom:18px">
+      <div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap">
         <select id="claim-filter" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:var(--radius-sm);font-size:13px;outline:none;font-family:inherit;cursor:pointer;box-shadow:var(--shadow-xs)">
           <option value="all">All confidence</option><option value="high">High (≥80%)</option><option value="mid">Medium (40-80%)</option><option value="low">Low (&lt;40%)</option>
         </select>
-        <input type="text" id="claim-search" placeholder="Filter claims..." style="flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:var(--radius-sm);font-size:13.5px;outline:none;font-family:inherit;box-shadow:var(--shadow-xs)">
+        <select id="claim-type-filter" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:var(--radius-sm);font-size:13px;outline:none;font-family:inherit;cursor:pointer;box-shadow:var(--shadow-xs)">
+          <option value="all">All types</option><option value="fact">fact</option><option value="observation">observation</option><option value="preference">preference</option><option value="hypothesis">hypothesis</option><option value="status">status</option><option value="attribute">attribute</option>
+        </select>
+        <input type="text" id="claim-search" placeholder="Filter claims..." style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:var(--radius-sm);font-size:13.5px;outline:none;font-family:inherit;box-shadow:var(--shadow-xs)">
       </div>
-      <div class="panel"><table><thead><tr><th>Conf</th><th>Statement</th><th>Page</th><th>Src</th><th>Age</th></tr></thead><tbody id="claims-table"></tbody></table></div>
+      <div class="panel"><table><thead><tr><th>Conf</th><th>Type</th><th>Statement</th><th>Page</th><th>Src</th><th>Age</th><th></th></tr></thead><tbody id="claims-table"></tbody></table></div>
     </div>
     <div id="view-pages" class="view">
       <input type="text" id="page-search" placeholder="Filter pages..." style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:var(--radius-sm);font-size:14px;outline:none;margin-bottom:18px;font-family:inherit;box-shadow:var(--shadow-xs)">
-      <div class="panel"><table><thead><tr><th>Title</th><th>Kind</th><th>Metadata</th><th>Claims</th><th>Links</th><th>Updated</th></tr></thead><tbody id="pages-table"></tbody></table></div>
+      <div class="panel"><table><thead><tr><th>Title</th><th>Kind</th><th>Entity</th><th>Metadata</th><th>Claims</th><th>Links</th><th>Updated</th></tr></thead><tbody id="pages-table"></tbody></table></div>
+    </div>
+    <div id="view-entities" class="view">
+      <input type="text" id="entity-search" placeholder="Filter entities..." style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:var(--radius-sm);font-size:14px;outline:none;margin-bottom:18px;font-family:inherit;box-shadow:var(--shadow-xs)">
+      <div class="panel"><table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Aliases</th><th>Claims</th><th>Rels</th><th>Page</th></tr></thead><tbody id="entities-table"></tbody></table></div>
     </div>
     <div id="view-timeline" class="view">
-      <div class="panel"><div class="panel-header">🕐 Epistemic Timeline</div><div class="panel-body" id="timeline-list"></div></div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <button type="button" class="tl-tab active" data-tl-tab="claims" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;font-family:inherit">Claim events</button>
+        <button type="button" class="tl-tab" data-tl-tab="entity" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim);padding:8px 14px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;font-family:inherit">Entity state</button>
+      </div>
+      <div class="panel"><div class="panel-header">🕐 Timeline</div><div class="panel-body" id="timeline-list"></div></div>
+    </div>
+    <div id="view-review" class="view">
+      <div class="panel"><div class="panel-header">✅ Pending alias review</div><div class="panel-body" id="review-queue-list"></div></div>
     </div>
     <div id="view-health" class="view">
-      <div class="panel"><div class="panel-header">📊 Knowledge Health</div><div class="panel-body"><div class="health-rings" id="health-rings"></div></div></div>
+      <div class="panel"><div class="panel-header">📊 Knowledge Health</div><div class="panel-body"><div class="health-rings" id="health-rings"></div><div id="health-ontology" style="margin-top:14px"></div></div></div>
       <div class="grid-2" style="margin-top:16px">
         <div class="panel"><div class="panel-header">🎯 Actions</div><div class="panel-body"><ul class="health-actions" id="health-actions"></ul></div></div>
         <div class="panel"><div class="panel-header">⏰ Stale Claims</div><div class="panel-body" id="stale-claims"></div></div>
@@ -607,15 +791,18 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
   <div class="slideOver-body" id="slideOver-body"></div>
 </div>
 <script>
-let DATA={};let searchDebounce=null;const chatHistory=[];const APP_VERSION='${esc(version)}';
+let DATA={};let searchDebounce=null;const chatHistory=[];const APP_VERSION='${esc(version)}';let timelineTab='claims';
 async function fetchAll(){
-  const[stats,pages,claims,sources,graph,health,events]=await Promise.all([
+  const[stats,pages,claims,sources,graph,health,events,entities,reviewQueue,entityState]=await Promise.all([
     fetch('/api/stats').then(r=>r.json()),fetch('/api/pages').then(r=>r.json()),
     fetch('/api/claims').then(r=>r.json()),fetch('/api/sources').then(r=>r.json()),
     fetch('/api/graph').then(r=>r.json()),fetch('/api/health').then(r=>r.json()),
     fetch('/api/events').then(r=>r.json()),
+    fetch('/api/entities').then(r=>r.json()),
+    fetch('/api/review-queue').then(r=>r.json()),
+    fetch('/api/entity-state').then(r=>r.json()),
   ]);
-  DATA={stats,pages,claims,sources,graph,health,events};
+  DATA={stats,pages,claims,sources,graph,health,events,entities,reviewQueue,entityState};
 }
 async function refreshData(){await fetchAll();renderAll();}
 document.querySelectorAll('.nav-item').forEach(item=>{
@@ -633,23 +820,42 @@ document.addEventListener('keydown',e=>{
 });
 const searchInput=document.getElementById('global-search');
 const searchResultsEl=document.getElementById('search-results');
+function parseSearchPrefixes(raw){
+  const prefixes={};let text=raw;
+  const re=/\\b(entity|claim|page|kind):(\\S+)/gi;
+  let m;while((m=re.exec(raw))!==null){prefixes[m[1].toLowerCase()]=m[2].toLowerCase();text=text.replace(m[0],'');}
+  return{prefixes,text:text.trim()};
+}
 searchInput.addEventListener('input',()=>{
   clearTimeout(searchDebounce);
   searchDebounce=setTimeout(async()=>{
     const q=searchInput.value.trim();
     if(q.length<2){closeSearch();return;}
-    const res=await fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json());
-    const items=[...res.pages.map(p=>({...p,kind:'page'})),...res.claims.map(c=>({...c,kind:'claim'}))];
-    if(!items.length){searchResultsEl.innerHTML='<div style="padding:14px;text-align:center;color:var(--text-dim);font-size:13px">No results</div>';}
+    const{prefixes,text}=parseSearchPrefixes(q);
+    const apiQ=text||q.replace(/\\S+:\\S+/g,'').trim();
+    const res=apiQ.length>=2?await fetch('/api/search?q='+encodeURIComponent(apiQ)).then(r=>r.json()):{pages:[],claims:[],relations:[]};
+    const rels=res.relations||[];
+    const ql=(text||q).toLowerCase();
+    let matchedEntities=(DATA.entities||[]).filter(e=>(e.canonicalName||'').toLowerCase().includes(ql)||(e.type||'').toLowerCase().includes(ql));
+    if(prefixes.entity)matchedEntities=matchedEntities.filter(e=>(e.type||'').toLowerCase()===prefixes.entity);
+    matchedEntities=matchedEntities.slice(0,8);
+    let filteredClaims=res.claims||[];
+    if(prefixes.claim)filteredClaims=filteredClaims.filter(c=>(c.claimType||'').toLowerCase()===prefixes.claim);
+    let filteredPages=res.pages||[];
+    if(prefixes.kind||prefixes.page){const k=prefixes.kind||prefixes.page;filteredPages=filteredPages.filter(p=>{const pg=DATA.pages.find(x=>x.id===p.id);return pg&&(pg.kind||'').toLowerCase()===k;});}
+    const items=[...matchedEntities.map(e=>({...e,kind:'entity'})),...filteredPages.map(p=>({...p,kind:'page'})),...filteredClaims.map(c=>({...c,kind:'claim'})),...rels.map(r=>({...r,kind:'relation'}))];
+    if(!items.length){searchResultsEl.innerHTML='<div style="padding:14px;text-align:center;color:var(--text-dim);font-size:13px">No results'+(Object.keys(prefixes).length?' <span style="opacity:.6">(filtered by '+Object.entries(prefixes).map(([k,v])=>k+':'+v).join(', ')+')</span>':'')+'</div>';}
     else{searchResultsEl.innerHTML=items.map(i=>{
+      if(i.kind==='entity')return'<div class="search-result-item" data-action="entity" data-id="'+i.id+'"><span class="sr-type sr-entity">'+esc(i.type)+'</span><span>'+esc(i.canonicalName)+'</span><span style="font-size:11px;color:var(--text-xdim);margin-left:auto">'+i.claimCount+' claims · '+i.relationCount+' rels</span></div>';
       if(i.kind==='page')return'<div class="search-result-item" data-action="page" data-id="'+i.id+'"><span class="sr-type sr-page">Page</span><span>'+esc(i.title)+'</span></div>';
-      return'<div class="search-result-item" data-action="claim" data-id="'+i.pageId+'"><span class="sr-type sr-claim">Claim</span><span>'+esc(i.statement.slice(0,80))+'</span>'+confBadge(i.confidence)+'</div>';
+      if(i.kind==='relation')return'<div class="search-result-item" data-action="noop" style="cursor:default"><span class="sr-type" style="background:var(--accent-dim);color:var(--accent)">Rel</span><span style="font-size:12px">'+esc(i.from.name)+' <code style="font-size:10px">'+esc(i.relation_type)+'</code> '+esc(i.to.name)+'</span></div>';
+      return'<div class="search-result-item" data-action="claim" data-id="'+i.pageId+'"><span class="sr-type sr-claim">'+esc(i.claimType||'claim')+'</span><span>'+esc(i.statement.slice(0,80))+'</span>'+confBadge(i.confidence)+'</div>';
     }).join('');}
     searchResultsEl.classList.add('active');
   },200);
 });
 searchInput.addEventListener('focus',()=>{if(searchInput.value.trim().length>=2)searchResultsEl.classList.add('active');});
-searchResultsEl.addEventListener('click',e=>{const item=e.target.closest('.search-result-item');if(!item)return;openPage(item.dataset.id);closeSearch();});
+searchResultsEl.addEventListener('click',e=>{const item=e.target.closest('.search-result-item');if(!item)return;const act=item.dataset.action;if(act==='noop')return;if(act==='entity'){openEntity(item.dataset.id);closeSearch();return;}openPage(item.dataset.id);closeSearch();});
 document.addEventListener('click',e=>{if(!e.target.closest('.search-wrapper'))closeSearch();});
 function closeSearch(){searchResultsEl.classList.remove('active');}
 
@@ -761,6 +967,12 @@ async function openSource(sourceId){
 function confBadge(val){const pct=(val*100).toFixed(0)+'%';if(val>=0.8)return'<span class="badge badge-green">'+pct+'</span>';if(val>=0.4)return'<span class="badge badge-yellow">'+pct+'</span>';return'<span class="badge badge-red">'+pct+'</span>';}
 function relTime(iso){if(!iso)return'';const diff=Date.now()-new Date(iso).getTime();if(diff<3600000)return Math.floor(diff/60000)+'m ago';if(diff<86400000)return Math.floor(diff/3600000)+'h ago';return Math.floor(diff/86400000)+'d ago';}
 function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';}
+function claimTypeBadge(t){
+  const k=String(t||'fact');
+  const map={fact:'#78716C',observation:'#0EA5E9',preference:'#16A34A',hypothesis:'#A855F7',status:'#CA8A04',attribute:'#6366F1'};
+  const c=map[k]||'#78716C';
+  return'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;background:'+c+'22;color:'+c+'">'+esc(k)+'</span>';
+}
 function renderMarkdown(md){
   if(!md)return'';
   let text=md.replace(/^---[\\s\\S]*?---/,'').trim();
@@ -813,7 +1025,8 @@ function formatInline(s){
 
 function renderStatsRow(){
   const{stats,health}=DATA;
-  document.getElementById('stats-row').innerHTML=sCard(stats.sources,'Sources','accent')+sCard(stats.pages,'Pages','accent')+sCard(stats.claims,'Claims','accent')+sCard(health.highConfidence,'High Conf','green')+sCard(health.mediumConfidence,'Mid Conf','yellow')+sCard(health.lowConfidence,'Low Conf','red')+sCard(stats.events,'Events','accent');
+  const entCount=(DATA.entities||[]).length;
+  document.getElementById('stats-row').innerHTML=sCard(stats.sources,'Sources','accent')+sCard(stats.pages,'Pages','accent')+sCard(entCount,'Entities','green')+sCard(stats.claims,'Claims','accent')+sCard(health.highConfidence,'High Conf','green')+sCard(health.mediumConfidence,'Mid Conf','yellow')+sCard(health.lowConfidence,'Low Conf','red')+sCard(stats.events,'Events','accent');
 }
 function sCard(v,l,c){return'<div class="stat-card '+c+'"><div class="value">'+v+'</div><div class="label">'+l+'</div></div>';}
 function renderSidebarStats(){
@@ -823,6 +1036,9 @@ function renderSidebarStats(){
   document.getElementById('prune-topics-btn').addEventListener('click',async()=>{if(!confirm('Delete topic pages (kind=topic) that have no claims? Typed entities are kept.'))return;const r=await fetch('/api/prune-topics',{method:'POST'}).then(x=>x.json());alert('Pruned '+r.pruned+' topic stubs; wiki re-rendered.');await refreshData();});
   document.getElementById('nav-claims-count').textContent=stats.claims;
   document.getElementById('nav-pages-count').textContent=stats.pages;
+  const ent=(DATA.entities||[]).length;
+  const nec=document.getElementById('nav-entities-count');
+  if(nec)nec.textContent=ent;
 }
 function renderOverview(){
   const{claims,health,events,sources}=DATA;
@@ -853,17 +1069,20 @@ function renderConfChart(){
 function renderClaims(){applyClaimFilters();}
 function applyClaimFilters(){
   const filter=document.getElementById('claim-filter').value;
+  const typeFilter=document.getElementById('claim-type-filter').value;
   const search=(document.getElementById('claim-search').value||'').toLowerCase();
   const pageMap=Object.fromEntries(DATA.pages.map(p=>[p.id,p.title]));
   let filtered=DATA.claims;
   if(filter==='high')filtered=filtered.filter(c=>c.confidence>=0.8);
   else if(filter==='mid')filtered=filtered.filter(c=>c.confidence>=0.4&&c.confidence<0.8);
   else if(filter==='low')filtered=filtered.filter(c=>c.confidence<0.4);
+  if(typeFilter!=='all')filtered=filtered.filter(c=>(c.claimType||'fact')===typeFilter);
   if(search)filtered=filtered.filter(c=>c.statement.toLowerCase().includes(search)||(pageMap[c.pageId]||'').toLowerCase().includes(search));
-  document.getElementById('claims-table').innerHTML=filtered.map(c=>'<tr data-page-id="'+c.pageId+'"><td style="width:70px">'+confBadge(c.confidence)+'</td><td>'+esc(c.statement)+'</td><td><span class="page-link">'+esc(pageMap[c.pageId]||'?')+'</span></td><td style="text-align:center">'+c.sources+'</td><td style="color:var(--text-dim)">'+relTime(c.lastReinforced)+'</td><td style="width:36px;text-align:center"><button class="delete-claim-btn" data-claim-id="'+c.id+'" title="Delete claim" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:14px;padding:2px 6px;border-radius:4px;transition:var(--transition)" onmouseover="this.style.color=\\'var(--red)\\';this.style.background=\\'var(--red-dim)\\'" onmouseout="this.style.color=\\'var(--text-xdim)\\';this.style.background=\\'none\\'">✕</button></td></tr>').join('');
+  document.getElementById('claims-table').innerHTML=filtered.map(c=>'<tr data-page-id="'+c.pageId+'"><td style="width:70px">'+confBadge(c.confidence)+'</td><td style="width:88px">'+claimTypeBadge(c.claimType||'fact')+'</td><td>'+esc(c.statement)+'</td><td><span class="page-link">'+esc(pageMap[c.pageId]||'?')+'</span></td><td style="text-align:center">'+c.sources+'</td><td style="color:var(--text-dim)">'+relTime(c.lastReinforced)+'</td><td style="width:36px;text-align:center"><button class="delete-claim-btn" data-claim-id="'+c.id+'" title="Delete claim" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:14px;padding:2px 6px;border-radius:4px;transition:var(--transition)" onmouseover="this.style.color=\\'var(--red)\\';this.style.background=\\'var(--red-dim)\\'" onmouseout="this.style.color=\\'var(--text-xdim)\\';this.style.background=\\'none\\'">✕</button></td></tr>').join('');
   document.querySelectorAll('.delete-claim-btn').forEach(btn=>{btn.addEventListener('click',async(e)=>{e.stopPropagation();if(!confirm('Delete this claim?'))return;await fetch('/api/claim?id='+btn.dataset.claimId,{method:'DELETE'});await refreshData();renderClaims();});});
 }
 document.getElementById('claim-filter').addEventListener('change',applyClaimFilters);
+document.getElementById('claim-type-filter').addEventListener('change',applyClaimFilters);
 document.getElementById('claim-search').addEventListener('input',applyClaimFilters);
 function renderPages(){applyPageFilter();}
 function applyPageFilter(){
@@ -881,30 +1100,144 @@ function applyPageFilter(){
   const keys=Object.keys(byKind).sort();
   let html='';
   for(const k of keys){
-    html+='<tr class="kind-section"><td colspan="6" style="background:var(--surface-hover);font-weight:600;padding:8px 12px">'+esc(k)+' <span style="font-weight:400;color:var(--text-dim)">('+byKind[k].length+')</span></td></tr>';
+    html+='<tr class="kind-section"><td colspan="7" style="background:var(--surface-hover);font-weight:600;padding:8px 12px">'+esc(k)+' <span style="font-weight:400;color:var(--text-dim)">('+byKind[k].length+')</span></td></tr>';
     for(const p of byKind[k]){
       const rawMeta=JSON.stringify(p.metadata||{});
       const metaPreview=p.metadata&&Object.keys(p.metadata).length?(esc(rawMeta.length>80?rawMeta.slice(0,80)+'…':rawMeta)):'—';
-      html+='<tr data-page-id="'+p.id+'"><td><span class="page-link">'+esc(p.title)+'</span></td><td><code style="font-size:11px">'+esc(String(p.kind||'topic'))+'</code></td><td style="font-size:11px;color:var(--text-dim);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(rawMeta)+'">'+metaPreview+'</td><td style="text-align:center">'+p.claimCount+'</td><td style="text-align:center">'+p.linkCount+'</td><td style="color:var(--text-dim)">'+relTime(p.updatedAt)+'</td></tr>';
+      const entCell=p.entityId?'<span class="entity-chip" data-entity-id="'+esc(p.entityId)+'" style="cursor:pointer;display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;background:var(--accent-dim);color:var(--accent)">🏷️ Entity</span>':'—';
+      html+='<tr data-page-id="'+p.id+'"><td><span class="page-link">'+esc(p.title)+'</span></td><td><code style="font-size:11px">'+esc(String(p.kind||'topic'))+'</code></td><td style="text-align:center">'+entCell+'</td><td style="font-size:11px;color:var(--text-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(rawMeta)+'">'+metaPreview+'</td><td style="text-align:center">'+p.claimCount+'</td><td style="text-align:center">'+p.linkCount+'</td><td style="color:var(--text-dim)">'+relTime(p.updatedAt)+'</td></tr>';
     }
   }
   document.getElementById('pages-table').innerHTML=html;
 }
 document.getElementById('page-search').addEventListener('input',applyPageFilter);
-document.addEventListener('click',e=>{const srow=e.target.closest('tr[data-source-id]');if(srow){openSource(srow.dataset.sourceId);return;}const row=e.target.closest('tr[data-page-id]');if(row)openPage(row.dataset.pageId);});
+function renderEntities(){applyEntityFilter();}
+function applyEntityFilter(){
+  const q=(document.getElementById('entity-search').value||'').toLowerCase();
+  let list=DATA.entities||[];
+  if(q)list=list.filter(e=>(e.canonicalName||'').toLowerCase().includes(q)||(e.type||'').toLowerCase().includes(q)||JSON.stringify(e.metadata||{}).toLowerCase().includes(q));
+  const byType={};
+  for(const e of list){
+    const t=e.type||'unknown';
+    (byType[t]=byType[t]||[]).push(e);
+  }
+  const keys=Object.keys(byType).sort();
+  let html='';
+  for(const t of keys){
+    html+='<tr class="entity-kind-section"><td colspan="7" style="background:var(--surface-hover);font-weight:600;padding:8px 12px">'+esc(t)+' <span style="font-weight:400;color:var(--text-dim)">('+byType[t].length+')</span></td></tr>';
+    for(const e of byType[t]){
+      const pageCell=e.primaryPageId?'<span class="page-link-entity" data-page-id="'+esc(e.primaryPageId)+'" style="cursor:pointer;color:var(--accent)">open</span>':'—';
+      html+='<tr data-entity-id="'+esc(e.id)+'" style="cursor:pointer"><td>'+esc(e.canonicalName)+'</td><td><code style="font-size:11px">'+esc(e.type)+'</code></td><td>'+esc(e.status||'active')+'</td><td style="text-align:center">'+(e.aliasCount||0)+'</td><td style="text-align:center">'+(e.claimCount||0)+'</td><td style="text-align:center">'+(e.relationCount||0)+'</td><td>'+pageCell+'</td></tr>';
+    }
+  }
+  if(!html)html='<tr><td colspan="7" style="padding:16px;color:var(--text-dim)">No entities yet. Ingest typed vault notes (person, project, …) to create entity rows.</td></tr>';
+  document.getElementById('entities-table').innerHTML=html;
+}
+document.getElementById('entity-search').addEventListener('input',applyEntityFilter);
+async function openEntity(entityId){
+  const d=await fetch('/api/entity?id='+encodeURIComponent(entityId)).then(r=>r.json());
+  if(d.error){alert(d.error);return;}
+  const meta=JSON.stringify(d.entity.metadata||{},null,2);
+  let html='<div class="slideOver-section"><h3>'+esc(d.entity.canonicalName)+'</h3><p style="font-size:12px;color:var(--text-dim)"><code>'+esc(d.entity.type)+'</code> · '+esc(d.entity.status)+'</p></div>';
+  if(d.aliases&&d.aliases.length)html+='<div class="slideOver-section"><h3>Aliases</h3><p style="font-size:13px">'+d.aliases.map(a=>'<code style="margin-right:6px">'+esc(a)+'</code>').join('')+'</p></div>';
+  if(d.relations&&d.relations.length){
+    html+='<div class="slideOver-section"><h3>Relations</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
+    html+=d.relations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong>'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
+    html+='</ul></div>';
+  }
+  html+='<div class="slideOver-section"><h3>Metadata</h3><pre style="font-size:11px;overflow:auto;max-height:180px;background:var(--surface);padding:10px;border-radius:6px">'+esc(meta)+'</pre></div>';
+  if(d.claims&&d.claims.length){
+    html+='<div class="slideOver-section"><h3>Claims ('+d.claims.length+')</h3>';
+    html+=d.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+claimTypeBadge(c.claimType||'fact')+'<div style="flex:1;font-size:13px">'+esc(c.statement)+'</div></div>').join('');
+    html+='</div>';
+  }
+  html+='<div class="slideOver-section"><h3>Compiled views</h3><p style="font-size:12px;color:var(--text-dim)">Cached LLM summaries (regenerate on demand).</p>';
+  html+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0">';
+  [['summary','Summary'],['agent_context','Agent ctx'],['status_card','Status'],['briefing','Briefing']].forEach(function(p){html+='<button type="button" class="cv-load" data-vt="'+p[0]+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">'+p[1]+'</button>';});
+  html+='</div><pre id="cv-out" style="font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;background:var(--surface);padding:10px;border-radius:6px;margin:0">Select a tab…</pre></div>';
+  if(d.primaryPageId)html+='<div style="margin-top:12px"><button type="button" class="open-primary-page-btn" data-page-id="'+esc(d.primaryPageId)+'" style="background:var(--accent);color:white;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px">Open primary page</button></div>';
+  openSlideOver(html,d.entity.canonicalName);
+  const sbody=document.getElementById('slideOver-body');
+  const cvOut=sbody.querySelector('#cv-out');
+  sbody.querySelectorAll('.cv-load').forEach(function(btn){
+    btn.addEventListener('click',async function(){
+      if(cvOut)cvOut.textContent='Loading…';
+      const r=await fetch('/api/compiled-view?entity_id='+encodeURIComponent(entityId)+'&view_type='+btn.dataset.vt).then(function(x){return x.json();});
+      if(cvOut)cvOut.textContent=r.error?r.error:(r.body||'');
+    });
+  });
+  const ob=sbody.querySelector('.open-primary-page-btn');
+  if(ob)ob.addEventListener('click',()=>openPage(ob.dataset.pageId));
+}
+document.addEventListener('click',e=>{
+  const chip=e.target.closest('.entity-chip');
+  if(chip){e.stopPropagation();openEntity(chip.dataset.entityId);return;}
+  const entRow=e.target.closest('tr[data-entity-id]');
+  if(entRow&&!e.target.closest('.page-link-entity')){openEntity(entRow.dataset.entityId);return;}
+  const pl=e.target.closest('.page-link-entity');
+  if(pl){e.stopPropagation();openPage(pl.dataset.pageId);return;}
+  const srow=e.target.closest('tr[data-source-id]');
+  if(srow){openSource(srow.dataset.sourceId);return;}
+  const row=e.target.closest('tr[data-page-id]');
+  if(row)openPage(row.dataset.pageId);
+});
 
 function renderTimeline(){
+  const el=document.getElementById('timeline-list');
+  if(timelineTab==='entity'){
+    const rows=DATA.entityState||[];
+    if(!rows.length){el.innerHTML='<p style="color:var(--text-dim)">No entity metadata changes logged yet.</p>';return;}
+    el.innerHTML=rows.map(function(r){
+      const ov=typeof r.oldValue==='object'?JSON.stringify(r.oldValue):String(r.oldValue==null?'—':r.oldValue);
+      const nv=typeof r.newValue==='object'?JSON.stringify(r.newValue):String(r.newValue==null?'—':r.newValue);
+      return'<div class="tl-event"><div class="tl-dot tl-created"></div><span class="tl-date">'+new Date(r.createdAt).toLocaleString()+'</span><span class="tl-type">entity</span><span class="tl-stmt tl-ent-st" data-entity-id="'+esc(r.entityId)+'" style="cursor:pointer"><strong>'+esc(r.entityCanonicalName)+'</strong> · <code>'+esc(r.fieldPath)+'</code><br><span style="font-size:11px;color:var(--text-dim)">'+esc(ov.slice(0,80))+' → '+esc(nv.slice(0,80))+'</span></span></div>';
+    }).join('');
+    el.querySelectorAll('.tl-ent-st').forEach(function(x){x.addEventListener('click',function(){openEntity(x.dataset.entityId);});});
+    return;
+  }
   const{events}=DATA;
-  if(!events.length){document.getElementById('timeline-list').innerHTML='<p style="color:var(--text-dim)">No events yet.</p>';return;}
-  document.getElementById('timeline-list').innerHTML=events.map(e=>{
+  if(!events.length){el.innerHTML='<p style="color:var(--text-dim)">No events yet.</p>';return;}
+  el.innerHTML=events.map(e=>{
     const up=e.confidenceAfter>=e.confidenceBefore;
     return'<div class="tl-event"><div class="tl-dot tl-'+e.type+'"></div><span class="tl-date">'+new Date(e.date).toLocaleString()+'</span><span class="tl-type">'+e.type+'</span><span class="tl-stmt" data-claim-id="'+(e.claimId||'')+'">'+esc(e.claimStatement.slice(0,70))+'</span><span class="tl-delta" style="color:'+(up?'var(--green)':'var(--red)')+'">'+(e.confidenceBefore*100).toFixed(0)+'% '+(up?'↑':'↓')+' '+(e.confidenceAfter*100).toFixed(0)+'%</span></div>';
   }).join('');
-  document.querySelectorAll('.tl-stmt[data-claim-id]').forEach(el=>{el.addEventListener('click',()=>{const claim=DATA.claims.find(c=>c.id===el.dataset.claimId);if(claim)openPage(claim.pageId);});});
+  el.querySelectorAll('.tl-stmt[data-claim-id]').forEach(el=>{el.addEventListener('click',()=>{const claim=DATA.claims.find(c=>c.id===el.dataset.claimId);if(claim)openPage(claim.pageId);});});
+}
+document.querySelectorAll('.tl-tab').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    document.querySelectorAll('.tl-tab').forEach(function(b){b.classList.remove('active');});
+    btn.classList.add('active');
+    timelineTab=btn.dataset.tlTab;
+    renderTimeline();
+  });
+});
+function renderReviewQueue(){
+  const items=(DATA.reviewQueue&&DATA.reviewQueue.items)||[];
+  const el=document.getElementById('review-queue-list');
+  const badge=document.getElementById('nav-review-count');
+  if(badge)badge.textContent=String(items.length);
+  if(!el)return;
+  if(!items.length){el.innerHTML='<p style="color:var(--text-dim)">No pending aliases. Extraction may add candidates via <code>possible_alias</code>.</p>';return;}
+  el.innerHTML='<table><thead><tr><th>Surface</th><th>Candidate entity</th><th>When</th><th></th></tr></thead><tbody>'+
+    items.map(function(it){return'<tr><td><code>'+esc(it.surfaceForm)+'</code></td><td>'+esc(it.candidateEntityName)+'</td><td style="color:var(--text-dim);font-size:12px">'+relTime(it.createdAt)+'</td><td><button type="button" class="rq-confirm" data-id="'+esc(it.id)+'" style="margin-right:6px;background:var(--accent);color:#fff;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px">Confirm</button><button type="button" class="rq-dismiss" data-id="'+esc(it.id)+'" style="background:var(--surface2);border:1px solid var(--border);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px">Dismiss</button></td></tr>';}).join('')+
+    '</tbody></table>';
+  el.querySelectorAll('.rq-confirm').forEach(function(b){b.addEventListener('click',async function(){await fetch('/api/review-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'confirm',id:b.dataset.id})});await refreshData();});});
+  el.querySelectorAll('.rq-dismiss').forEach(function(b){b.addEventListener('click',async function(){await fetch('/api/review-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'dismiss',id:b.dataset.id})});await refreshData();});});
 }
 function renderHealth(){
   const{health}=DATA;const total=health.totalClaims||1;
   document.getElementById('health-rings').innerHTML=healthRing(health.highConfidence/total,'var(--green)','High',health.highConfidence)+healthRing(health.mediumConfidence/total,'var(--yellow)','Medium',health.mediumConfidence)+healthRing(health.lowConfidence/total,'var(--red)','Low',health.lowConfidence);
+  const ho=document.getElementById('health-ontology');
+  const ont=health.ontology;
+  if(ho&&ont){
+    ho.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;font-size:12px;color:var(--text-dim)">'+
+      '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.entityCount+'</div>Entities</div>'+
+      '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.entitiesWithPrimaryPage+'</div>Linked pages</div>'+
+      '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.relationCount+'</div>Relations</div>'+
+      '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.pendingAliasCount+'</div>Pending aliases</div>'+
+      '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.staleCompiledViewCount+'</div>Stale views</div>'+
+      '</div>';
+  }
   const actions=health.suggestedActions.length?health.suggestedActions:['No actions needed.'];
   document.getElementById('health-actions').innerHTML=actions.map(a=>'<li>💡 '+esc(a)+'</li>').join('');
   document.getElementById('stale-claims').innerHTML=health.staleClaims.length===0?'<p style="color:var(--text-dim)">None</p>':'<table><tbody>'+health.staleClaims.slice(0,8).map(c=>'<tr><td>'+esc(c.statement.slice(0,50))+'…</td><td style="color:var(--yellow);text-align:right">'+c.daysSince+'d</td></tr>').join('')+'</tbody></table>';
@@ -928,7 +1261,7 @@ function renderGraph(){
   const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
 
   /* ---- data prep ---- */
-  const allEdges=graph.edges.map(e=>({source:e.source,target:e.target,type:e.type,weight:e.weight||1,importance:e.importance||0}));
+  const allEdges=graph.edges.map(e=>({source:e.source,target:e.target,type:e.type,weight:e.weight||1,importance:e.importance||0,relationType:e.relationType}));
   const nodes=graph.nodes;
   const sourceGroups=graph.sourceGroups||{};
   const nodeById=new Map();nodes.forEach(n=>nodeById.set(n.id,n));
@@ -1016,8 +1349,16 @@ function renderGraph(){
       if(!src||!tgt||src.x===undefined)continue;
       if(!inView(src.x,src.y,100)&&!inView(tgt.x,tgt.y,100))continue;
       const sid=src.id,tid=tgt.id;
-      if(isHover&&sid!==hoverId&&tid!==hoverId){ctx.globalAlpha=0.03;ctx.strokeStyle=edgeColor;}else if(isHover){ctx.globalAlpha=1;ctx.strokeStyle=hoverEdgeColor;}else{ctx.globalAlpha=1;ctx.strokeStyle=l.type==='contradiction'?contradictionColor:edgeColor;}
-      ctx.lineWidth=(l.type==='contradiction'?1.5:0.7)/transform.k;
+      let strokeC=edgeColor;
+      if(l.type==='contradiction')strokeC=contradictionColor;
+      else if(l.type==='relation'){
+        const rt=String(l.relationType||'').toLowerCase();
+        if(rt==='child_of'||rt==='spouse_of')strokeC='rgba(244,114,182,0.9)';
+        else if(rt==='depends_on'||rt==='works_on'||rt==='stakeholder_of')strokeC='rgba(56,189,248,0.9)';
+        else strokeC='rgba(52,211,153,0.85)';
+      }
+      if(isHover&&sid!==hoverId&&tid!==hoverId){ctx.globalAlpha=0.03;ctx.strokeStyle=edgeColor;}else if(isHover){ctx.globalAlpha=1;ctx.strokeStyle=hoverEdgeColor;}else{ctx.globalAlpha=1;ctx.strokeStyle=strokeC;}
+      ctx.lineWidth=(l.type==='contradiction'?1.5:l.type==='relation'?1.1:0.7)/transform.k;
       ctx.beginPath();ctx.moveTo(src.x,src.y);ctx.lineTo(tgt.x,tgt.y);
       if(l.type==='contradiction'){ctx.setLineDash([4/transform.k,3/transform.k]);}else{ctx.setLineDash([]);}
       ctx.stroke();
@@ -1032,8 +1373,16 @@ function renderGraph(){
         if(!src||!tgt||src.x===undefined)return;
         const sid=src.id,tid=tgt.id;
         if(sid!==hoverId&&tid!==hoverId)return;
-        ctx.strokeStyle=l.type==='contradiction'?contradictionColor:hoverEdgeColor;
-        ctx.lineWidth=(l.type==='contradiction'?1.5:0.8)/transform.k;
+        let hStroke=hoverEdgeColor;
+        if(l.type==='contradiction')hStroke=contradictionColor;
+        else if(l.type==='relation'){
+          const rt=String(l.relationType||'').toLowerCase();
+          if(rt==='child_of'||rt==='spouse_of')hStroke='rgba(244,114,182,0.95)';
+          else if(rt==='depends_on'||rt==='works_on'||rt==='stakeholder_of')hStroke='rgba(56,189,248,0.95)';
+          else hStroke='rgba(52,211,153,0.9)';
+        }
+        ctx.strokeStyle=hStroke;
+        ctx.lineWidth=(l.type==='contradiction'?1.5:l.type==='relation'?1.2:0.8)/transform.k;
         if(l.type==='contradiction'){ctx.setLineDash([4/transform.k,3/transform.k]);}else{ctx.setLineDash([]);}
         ctx.beginPath();ctx.moveTo(src.x,src.y);ctx.lineTo(tgt.x,tgt.y);ctx.stroke();
       });
@@ -1148,7 +1497,8 @@ function renderGraph(){
         const hAdj=(adj.get(n.id)||new Set()).size;
         const hShared=(sharedSourceNeighbours.get(n.id)||new Set()).size;
         canvas.style.cursor='pointer';tooltip.style.display='block';
-        tooltip.innerHTML='<strong style="color:#cdd6f4">'+esc(n.label)+'</strong><br><span style="color:rgba(205,214,244,0.5)">'+(n.metadata.claims||0)+' claims</span><br>'+confBadge(n.metadata.avgConfidence||0)+'<br><span style="color:rgba(205,214,244,0.4);font-size:11px">'+hAdj+' links · '+hShared+' shared-source</span>';
+        const entLab=n.metadata.isEntity?' · <span style="color:#34d399">entity</span>':'';
+        tooltip.innerHTML='<strong style="color:#cdd6f4">'+esc(n.label)+'</strong>'+entLab+'<br><span style="color:rgba(205,214,244,0.5)">'+(n.metadata.claims||0)+' claims</span><br>'+confBadge(n.metadata.avgConfidence||0)+'<br><span style="color:rgba(205,214,244,0.4);font-size:11px">'+hAdj+' links · '+hShared+' shared-source</span>';
       }else{canvas.style.cursor='grab';tooltip.style.display='none';}
     }
     if(hoveredNode){tooltip.style.left=(mx+15)+'px';tooltip.style.top=(my-10)+'px';}
@@ -1188,6 +1538,26 @@ async function askQuestion(q){
           answerHtml+='</div>';
         }
       }
+      const rv=res.retrieval;
+      if(rv){
+        const rid='rd'+Date.now();
+        const strat=rv.strategy||'fts5';
+        const pillClass=strat==='hybrid'?'hybrid':(strat.startsWith('hybrid-')?'warn':'fts5');
+        const stratLabel=strat==='fts5'?'FTS5':strat==='hybrid'?'Hybrid':strat==='hybrid-no-key'?'FTS5 (no embed key)':'FTS5 (no embeddings)';
+        let detail='<b>Strategy:</b> '+stratLabel;
+        detail+=' · <b>Pages:</b> '+rv.pagesFound;
+        detail+=' · <b>Claims found:</b> '+rv.claimsCandidates;
+        detail+=' · <b>In context:</b> '+rv.claimsInContext;
+        detail+=' · <b>Relations:</b> '+rv.relationsFound;
+        if(rv.searchMs!=null)detail+=' · <b>Search:</b> '+rv.searchMs+'ms';
+        if(rv.llmMs!=null)detail+=' · <b>LLM:</b> '+rv.llmMs+'ms';
+        if(rv.claimTypes&&Object.keys(rv.claimTypes).length){detail+='<br><b>Claim types:</b> '+Object.entries(rv.claimTypes).map(([t,n])=>t+' ('+n+')').join(', ');}
+        if(rv.entityTypes&&Object.keys(rv.entityTypes).length){detail+=' · <b>Entity types:</b> '+Object.entries(rv.entityTypes).map(([t,n])=>t+' ('+n+')').join(', ');}
+        if(rv.embeddingModel)detail+='<br><b>Embedding model:</b> '+esc(rv.embeddingModel);
+        if(rv.embeddingsIndexed!=null)detail+=' · <b>Indexed:</b> '+rv.embeddingsIndexed;
+        if(rv.vectorCandidates!=null)detail+=' · <b>Vector candidates:</b> '+rv.vectorCandidates;
+        answerHtml+='<div class="retrieval-debug"><button class="retrieval-toggle '+pillClass+'" onclick="this.classList.toggle(\\'open\\');document.getElementById(\\''+rid+'\\').classList.toggle(\\'open\\')">'+stratLabel+'<span class="chevron">\u25BE</span></button><div class="retrieval-detail" id="'+rid+'">'+detail+'</div></div>';
+      }
       chatHistory.push({role:'bot',text:answerHtml+meta});
     }
   }catch(err){chatHistory.pop();chatHistory.push({role:'bot',text:'<span style="color:var(--red)">Failed to get answer: '+(err.message||'Check LLM config & API key.')+'</span>'});}
@@ -1204,7 +1574,7 @@ chatInput.addEventListener('input',()=>{chatInput.style.height='auto';chatInput.
 
 setInterval(async()=>{try{const s=await fetch('/api/stats').then(r=>r.json());if(JSON.stringify(s)!==JSON.stringify(DATA.stats)){await fetchAll();renderAll();}}catch{}},5000);
 
-function renderAll(){renderStatsRow();renderSidebarStats();renderOverview();renderClaims();renderPages();renderTimeline();renderHealth();renderChatSuggestions();if(graphRendered){graphRendered=false;renderGraph();}}
+function renderAll(){renderStatsRow();renderSidebarStats();renderOverview();renderClaims();renderPages();renderEntities();renderReviewQueue();renderTimeline();renderHealth();renderChatSuggestions();if(graphRendered){graphRendered=false;renderGraph();}}
 fetchAll().then(()=>renderAll());
 <\/script>
 </body>

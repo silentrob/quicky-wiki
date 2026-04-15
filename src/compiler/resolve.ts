@@ -1,5 +1,5 @@
 import type { KnowledgeStore } from "../graph/store.js";
-import type { LLMAdapter, Source, KnowledgeDiff } from "../types.js";
+import type { LLMAdapter, Source, KnowledgeDiff, QuickyConfig } from "../types.js";
 import { propagateCascade } from "../graph/cascade.js";
 import { parseLLMJson } from "../llm/parse-json.js";
 export async function resolveKnowledge(
@@ -7,7 +7,9 @@ export async function resolveKnowledge(
   llm: LLMAdapter,
   diff: KnowledgeDiff,
   source: Source,
-): Promise<void> {
+  config?: QuickyConfig,
+): Promise<{ relationsCompiled: number }> {
+  let relationsCompiled = 0;
   // 1. Reinforce existing claims
   for (const r of diff.reinforced) {
     store.reinforceClaim(
@@ -87,9 +89,29 @@ export async function resolveKnowledge(
         confidence: nc.confidence,
         sourceIds: [source.id],
         tags: nc.tags ?? [],
+        claimType: nc.claimType,
       });
       nc.claimId = claim.id;
       claimPageIds.push(page.id);
+    }
+  }
+
+  const newClaimRefs = diff.newClaims
+    .filter((nc) => nc.claimId)
+    .map((nc) => ({ claimId: nc.claimId, statement: nc.statement }));
+  if (newClaimRefs.length > 0) {
+    try {
+      const { compileRelationsFromClaims } = await import(
+        "./relation-compiler.js"
+      );
+      relationsCompiled = await compileRelationsFromClaims(
+        store,
+        llm,
+        newClaimRefs,
+        source.id,
+      );
+    } catch {
+      // Relation extraction is best-effort
     }
   }
 
@@ -117,6 +139,17 @@ export async function resolveKnowledge(
     touchedPageIds.add(pid);
   }
   await generatePageSummaries(store, llm, [...touchedPageIds]);
+
+  if (config) {
+    try {
+      const { syncEmbeddings } = await import("../embeddings/sync.js");
+      await syncEmbeddings(store, config);
+    } catch {
+      // Embeddings are optional (missing API key, network, etc.)
+    }
+  }
+
+  return { relationsCompiled };
 }
 
 export async function generatePageSummaries(

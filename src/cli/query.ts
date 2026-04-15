@@ -78,7 +78,7 @@ export async function queryCommand(
       );
     } else {
       // Standard single-model query
-      const result = await queryKnowledge(store, llm, question);
+      const result = await queryKnowledge(store, llm, question, config);
       spinner.stop();
 
       console.log(chalk.bold("\nAnswer:"));

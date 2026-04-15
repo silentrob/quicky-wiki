@@ -44,7 +44,24 @@ export function generateHealthReport(
       confidence: r.claim.confidence,
     }));
 
+  const ontology = store.getOntologyHealthSnapshot();
+
   const suggestedActions: string[] = [];
+  if (ontology.pendingAliasCount > 0)
+    suggestedActions.push(
+      `${ontology.pendingAliasCount} pending alias candidate(s) — review in the portal (Review queue)`,
+    );
+  if (ontology.staleCompiledViewCount > 8)
+    suggestedActions.push(
+      `${ontology.staleCompiledViewCount} compiled entity views are stale — open Entities and refresh compiled tabs`,
+    );
+  if (
+    ontology.entityCount > 0 &&
+    ontology.entitiesWithPrimaryPage < ontology.entityCount * 0.5
+  )
+    suggestedActions.push(
+      "Many entities lack a linked primary wiki page — check ingest / vault kinds",
+    );
   if (staleClaims.length > 5)
     suggestedActions.push(
       `Review ${staleClaims.length} stale claims that haven't been reinforced recently`,
@@ -75,5 +92,6 @@ export function generateHealthReport(
     cascadeRisks,
     gaps: [], // populated by discovery module
     suggestedActions,
+    ontology,
   };
 }

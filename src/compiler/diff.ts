@@ -1,11 +1,17 @@
 import type { KnowledgeStore } from "../graph/store.js";
-import type { LLMAdapter, Source, KnowledgeDiff } from "../types.js";
+import type {
+  LLMAdapter,
+  Source,
+  KnowledgeDiff,
+  ClaimType,
+} from "../types.js";
 import { mergeConfidence } from "./confidence.js";
 import { parseLLMJson } from "../llm/parse-json.js";
 
 interface ExtractedClaim {
   statement: string;
   confidence: number;
+  claimType: ClaimType;
   tags: string[];
   relatedConcepts: string[];
   dependsOnStatements: string[];
@@ -38,6 +44,7 @@ export async function computeKnowledgeDiff(
         statement: claim.statement,
         confidence: claim.confidence,
         tags: claim.tags,
+        claimType: claim.claimType,
       });
     }
 
@@ -139,6 +146,7 @@ Respond in JSON:
           statement: newClaim.statement,
           confidence: newClaim.confidence,
           tags: newClaim.tags,
+          claimType: newClaim.claimType,
         });
       }
     }
@@ -159,6 +167,7 @@ Respond in JSON:
         statement: claim.statement,
         confidence: claim.confidence,
         tags: claim.tags,
+        claimType: claim.claimType,
       });
     }
   }

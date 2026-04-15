@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import type { KnowledgeStore } from "../graph/store.js";
-import type { LLMAdapter, QuickyConfig } from "../types.js";
+import type { LLMAdapter, QuickyConfig, CompiledViewType } from "../types.js";
+import { COMPILED_VIEW_TYPES } from "../types.js";
 import { queryKnowledge } from "../graph/query.js";
 import { ingestSource } from "../compiler/ingest.js";
 import { generatePageSummaries } from "../compiler/resolve.js";
@@ -15,13 +16,14 @@ import { generateHealthReport } from "../metabolism/health.js";
  * Tools exposed:
  * - query_wiki: Ask a question against the knowledge base
  * - list_pages: List wiki pages (optional kind filter)
- * - list_entities: List pages by entity kind with metadata filters
+ * - list_entities: List first-class entities by type with metadata filters
  * - get_page: Get detailed page content
  * - search_wiki: FTS search pages and claims
  * - list_claims: List claims with optional confidence filter
  * - health_report: Get knowledge health report
  * - ingest_file: Ingest a source file (optional kind/metadata overrides)
  * - update_entity_metadata: Merge fields into page metadata_json
+ * - get_compiled_view: LLM-compiled entity view (summary, agent_context, status_card, briefing)
  */
 export function startMCPServer(
   store: KnowledgeStore,
@@ -67,7 +69,7 @@ const TOOLS = [
   {
     name: "list_entities",
     description:
-      "List wiki pages of a specific entity kind with structured metadata. Use for typed inventories (people, projects, etc.).",
+      "List first-class entities of a given type (person, project, etc.) with metadata, aliases, and claim counts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -108,6 +110,33 @@ const TOOLS = [
         query: { type: "string", description: "Search query" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "query_graph",
+    description:
+      "Traverse typed relations between entities (people, projects, etc.). Use when you need structured connections, not keyword search. Known relation_type values include: child_of, spouse_of, works_on, stakeholder_of, depends_on, located_in, related_to.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entity: {
+          type: "string",
+          description: "Entity name to start from (canonical name or alias)",
+        },
+        relation_types: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional filter: only these relation types. Omit for all types.",
+        },
+        direction: {
+          type: "string",
+          enum: ["outbound", "inbound", "both"],
+          description:
+            "outbound: entity → other; inbound: other → entity; both: default",
+        },
+      },
+      required: ["entity"],
     },
   },
   {
@@ -178,6 +207,30 @@ const TOOLS = [
       required: ["title", "metadata"],
     },
   },
+  {
+    name: "get_compiled_view",
+    description:
+      "Get or generate a compiled LLM view for an entity: summary, agent_context, status_card, or briefing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entity_id: {
+          type: "string",
+          description: "Entity UUID from list_entities",
+        },
+        view_type: {
+          type: "string",
+          enum: [...COMPILED_VIEW_TYPES],
+          description: "Which compiled slice to return",
+        },
+        force: {
+          type: "boolean",
+          description: "When true, regenerate even if cached and fresh",
+        },
+      },
+      required: ["entity_id", "view_type"],
+    },
+  },
 ];
 
 async function handleToolCall(
@@ -189,7 +242,12 @@ async function handleToolCall(
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
   switch (toolName) {
     case "query_wiki": {
-      const result = await queryKnowledge(store, llm, args.question as string);
+      const result = await queryKnowledge(
+        store,
+        llm,
+        args.question as string,
+        config,
+      );
       return {
         content: [
           {
@@ -237,18 +295,24 @@ async function handleToolCall(
     case "list_entities": {
       const kind = args.kind as string;
       const filter = args.filter as Record<string, unknown> | undefined;
-      const pages = store.listPages().filter((p) => p.kind === kind);
-      const matches = pages.filter((p) => {
+      const entities = store.listEntities({ type: kind });
+      const matches = entities.filter((e) => {
         if (!filter) return true;
-        return Object.entries(filter).every(([k, v]) => p.metadata[k] === v);
+        return Object.entries(filter).every(([k, v]) => e.metadata[k] === v);
       });
-      const result = matches.map((p) => ({
-        title: p.title,
-        kind: p.kind,
-        metadata: p.metadata,
-        summary: p.summary,
-        claimCount: store.getClaimsByPage(p.id).length,
-      }));
+      const result = matches.map((e) => {
+        const detail = store.getEntityDetail(e.id)!;
+        return {
+          id: e.id,
+          canonicalName: e.canonicalName,
+          type: e.type,
+          status: e.status,
+          metadata: e.metadata,
+          aliases: detail.aliases,
+          primaryPageTitle: detail.primaryPage?.title ?? null,
+          claimCount: detail.claims.length,
+        };
+      });
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
@@ -293,11 +357,36 @@ async function handleToolCall(
     }
 
     case "search_wiki": {
-      const results = store.search(args.query as string, 20);
+      const q = args.query as string;
+      const results = config.retrieval?.hybridSearch
+        ? await (await import("../embeddings/hybrid-search.js")).hybridSearch(
+            store,
+            q,
+            20,
+            config,
+          )
+        : store.search(q, 20);
       return {
         content: [
           { type: "text", text: JSON.stringify(results, null, 2) },
         ],
+      };
+    }
+
+    case "query_graph": {
+      const entity = args.entity as string;
+      const relationTypes = args.relation_types as string[] | undefined;
+      const direction = args.direction as
+        | "outbound"
+        | "inbound"
+        | "both"
+        | undefined;
+      const edges = store.queryGraph(entity, {
+        relationTypes,
+        direction: direction ?? "both",
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(edges, null, 2) }],
       };
     }
 
@@ -363,6 +452,7 @@ async function handleToolCall(
                 challenged: diff.challenged.length,
                 newPages: diff.newConcepts.length,
                 gaps: diff.gapsIdentified.length,
+                relationsCompiled: diff.relationsCompiled ?? 0,
               },
               null,
               2,
@@ -370,6 +460,75 @@ async function handleToolCall(
           },
         ],
       };
+    }
+
+    case "get_compiled_view": {
+      const entityId = args.entity_id as string;
+      const viewType = args.view_type as string;
+      const force = args.force === true;
+      if (!entityId || !viewType) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "entity_id and view_type required" }),
+            },
+          ],
+        };
+      }
+      if (!(COMPILED_VIEW_TYPES as readonly string[]).includes(viewType)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: `view_type must be one of: ${COMPILED_VIEW_TYPES.join(", ")}`,
+              }),
+            },
+          ],
+        };
+      }
+      try {
+        const { ensureCompiledView } = await import("../compiler/views.js");
+        const body = await ensureCompiledView(
+          store,
+          llm,
+          entityId,
+          viewType as CompiledViewType,
+          { force },
+        );
+        const row = store.getCompiledView(
+          entityId,
+          viewType as CompiledViewType,
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  body,
+                  stale: row?.stale ?? false,
+                  updatedAt: row?.updatedAt ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (e: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: e?.message || "get_compiled_view failed",
+              }),
+            },
+          ],
+        };
+      }
     }
 
     case "update_entity_metadata": {
@@ -388,6 +547,7 @@ async function handleToolCall(
         page.id,
         args.metadata as Record<string, unknown>,
       );
+      store.syncEntityWithPrimaryPage(page.id);
       const updated = store.getPage(page.id)!;
       return {
         content: [

@@ -1,8 +1,8 @@
 # ⚡ Quicky Wiki
 
-**Turn any collection of documents into a living, confidence-scored knowledge base — powered by LLMs.**
+**Turn any collection of documents into a living, confidence-scored knowledge graph — powered by LLMs.**
 
-Quicky Wiki extracts claims from your sources, tracks how confident each claim is, watches for contradictions, and gives you a visual dashboard to explore everything. Think of it as a personal Wikipedia that actually tells you what it's unsure about.
+Quicky Wiki extracts claims from your sources, tracks confidence over time, discovers relationships between entities, and gives you a visual dashboard to explore everything. Think of it as a personal Wikipedia with an opinion about what it's unsure about.
 
 [![npm version](https://img.shields.io/npm/v/quicky-wiki)](https://www.npmjs.com/package/quicky-wiki)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -21,9 +21,9 @@ qw serve                                     # open the dashboard
 
 That's it. Open `http://localhost:3737` and you've got:
 
-- A **knowledge graph** you can zoom into, hover over, and click through
-- **Ask Wiki** — chat with your knowledge base, get answers with confidence scores and citations
-- Claims, pages, timeline, and health views
+- A **knowledge graph** with typed entities and semantic relationships
+- **Ask Wiki** — chat with your knowledge base, get answers with confidence scores, citations, and retrieval diagnostics
+- Entities, claims, pages, timeline, health, and review views
 
 ## What Makes It Different
 
@@ -34,7 +34,31 @@ That's it. Open `http://localhost:3737` and you've got:
 | Contradictions? | Hidden in edit history | Surfaced automatically |
 | Temporal tracking? | ❌ | ✅ Claims strengthen, weaken, and decay over time |
 | Knowledge gaps? | Unknown unknowns | Discovered and suggested |
+| Entity awareness? | ❌ Flat pages | ✅ First-class entities with typed relationships |
+| Search? | Keyword only | FTS5 + optional hybrid vector search |
 | Multi-format output? | Just a wiki | Wiki, slides, flashcards, graph, timeline |
+
+## Fork: Knowledge Substrate Edition
+
+This fork evolves quicky-wiki from a claim-tracking document tool into a **knowledge substrate** — a structured graph of entities, typed relationships, and confidence-scored claims that can serve as the grounding layer for AI agents.
+
+### What changed from the original
+
+**Entities as first-class objects.** People, projects, places, and organizations are no longer just pages — they're typed entities with canonical names, aliases, structured metadata, and stable IDs that survive renames and re-ingests.
+
+**Typed relationships.** The graph has semantic edges: `child_of`, `spouse_of`, `works_on`, `stakeholder_of`, `depends_on`, `located_in`. Relationships are extracted automatically from claims by a relation compiler, carry confidence scores, and support temporal validity (`valid_from` / `valid_to`).
+
+**Claim subtypes.** Not all claims are created equal. Six types — `fact`, `observation`, `preference`, `hypothesis`, `status`, `attribute` — each with appropriate decay rates and retrieval weights. "Ted lives in Seattle" (fact, slow decay) is treated differently from "Hypercard is in proof-of-concept" (status, fast decay).
+
+**Hybrid retrieval.** Optional FTS5 + vector embedding search. When enabled, queries are scored with a weighted blend of lexical match, cosine similarity, confidence, recency, and entity-type boost. Configurable weights in `config.yaml`.
+
+**Smarter extraction.** The ingestion pipeline runs a relation compiler over new claims, extracts structured entity metadata per kind (person schemas, project schemas), and performs identity resolution against the known entity catalog with alias tracking.
+
+**Compiled views.** Pre-computed, entity-scoped views (`summary`, `agent_context`) stored in SQLite. Automatically marked stale when underlying claims or relations change, regenerated on demand.
+
+**Entity state tracking.** A change log (`entity_state_log`) records world-state transitions — "project status changed active → paused", "last_contact updated" — separate from epistemic events about belief changes.
+
+**Enhanced dashboard.** Entities view, review queue for pending aliases, retrieval debug panel in Ask Wiki, type-prefixed search (`entity:person`, `claim:fact`), entity counts on the overview, and graph visualization with typed relation edges.
 
 ## Install
 
@@ -114,13 +138,15 @@ qw serve --port 8080     # custom port
 ```
 
 The dashboard includes:
-- **Overview** — Stats at a glance
-- **Knowledge Graph** — Interactive canvas visualization (Obsidian-inspired dark theme, hover to unfold connections)
-- **Claims** — Browse all extracted claims with confidence scores
-- **Pages** — Wiki pages compiled from your claims (optional **entity kind** and metadata when configured)
-- **Timeline** — Temporal view of knowledge events
+- **Overview** — Stats at a glance: sources, pages, entities, claims, confidence distribution
+- **Knowledge Graph** — Interactive canvas visualization with typed relation edges and entity-type indicators
+- **Claims** — Browse all claims with confidence scores, type badges, and type filters
+- **Pages** — Wiki pages with entity badges and kind grouping
+- **Entities** — Browse entities by type (person, project, place, ...) with alias, claim, and relation counts
+- **Timeline** — Epistemic events and entity state transitions
 - **Health** — Knowledge integrity: stale claims, contradictions, gaps
-- **Ask Wiki** — Chat with your knowledge base
+- **Review Queue** — Pending alias resolutions flagged during ingestion
+- **Ask Wiki** — Chat with your knowledge base; retrieval debug shows search strategy, claim/entity type breakdown, and timing
 
 When you open a page, the slideout shows **Linked pages** (graph neighbors) and the **rendered wiki markdown** from `wiki/`. Inline **Obsidian-style wikilinks** work in that preview: `[[Page Title]]` and `[[label|Page Title]]` open the matching page by title. The dashboard script is embedded in the built CLI, so after changing TypeScript sources, run **`npm run build`** and restart `serve` to see UI updates.
 
@@ -158,21 +184,29 @@ qw discover --mode contradictions # conflicting claims
 ```
 Source Document
      ↓
-LLM Extraction → Claims (with confidence scores)
-     ↓                        ↓
-Knowledge Graph (SQLite)    Epistemic Events (temporal log)
+LLM Extraction → Claims (typed: fact, status, preference, ...)
+     ↓                   ↓
+Entity Resolution    Relation Compiler
+     ↓                   ↓
+Entities + Relations + Claims ← Knowledge Graph (SQLite)
+     ↓                              ↓
+Compiled Views              Epistemic Events (belief log)
+     ↓                     Entity State Log (world-state log)
      ↓
-Compiled Outputs: Wiki pages, slides, flashcards, graph, timeline
+Wiki pages, slides, graph, timeline, agent context cards
      ↓
-Dashboard (interactive visualization + chat)
+Dashboard (interactive visualization + chat + retrieval debug)
 ```
 
 ### Key Concepts
 
-- **Claim** — An atomic, verifiable statement extracted from a source. Has a confidence score, provenance, and dependency chain.
+- **Entity** — A first-class object (person, project, place, organization) with a canonical name, type, aliases, structured metadata, and stable ID.
+- **Relation** — A typed, directed edge between entities (`child_of`, `works_on`, `spouse_of`, ...) with confidence, temporal validity, and claim provenance.
+- **Claim** — An atomic, verifiable statement extracted from a source. Has a confidence score, a type (fact/observation/preference/hypothesis/status/attribute), provenance, and dependency chain.
 - **Epistemic Event** — A change in belief: created, reinforced, challenged, weakened, superseded, or resolved.
 - **Knowledge Diff** — When you ingest a new source, you see what's new, reinforced, challenged, and what gaps were found.
 - **Cascade** — When a foundational claim is challenged, confidence changes propagate through dependent claims.
+- **Compiled View** — A pre-computed, entity-scoped output (summary, agent context card) that stays fresh via staleness tracking.
 - **Metabolism** — Active maintenance: decay, resurfacing, red-teaming.
 
 ## MCP Server
@@ -184,22 +218,61 @@ qw mcp                          # stdio mode (for Claude Desktop, etc.)
 qw mcp --http --port 3000       # HTTP mode
 ```
 
-Tools include querying, search (full-text on the graph), listing pages and claims, ingestion, and health reporting. Pages can carry an **entity kind** and **metadata** (see config / compiled wiki frontmatter). MCP adds **`list_entities`** (filter by kind and metadata) and **`update_entity_metadata`** for merging metadata without re-ingesting; **`list_pages`** and **`ingest_file`** accept optional kind-related parameters. Use each tool’s schema in your MCP client for full argument lists.
+Tools include querying (with hybrid retrieval), search (FTS + optional vector), listing pages/claims/entities/relations, ingestion, graph traversal, and health reporting. Entity-aware tools: **`list_entities`** (filter by kind and metadata), **`query_graph`** (traverse typed relations), and **`update_entity_metadata`** (deep-merge metadata without re-ingesting). Use each tool’s schema in your MCP client for full argument lists.
 
 ## Project Structure
 
 ```
 my-wiki/
 ├── .quicky/
-│   ├── config.yaml          # LLM provider, model, wiki name
-│   └── graph.sqlite         # knowledge graph (claims, sources, events)
+│   ├── config.yaml          # LLM provider, model, wiki name, retrieval config
+│   └── graph.sqlite         # knowledge graph (see schema below)
 ├── raw/                     # your source documents (immutable)
 └── wiki/                    # compiled output (Obsidian-compatible markdown)
 ```
 
+### SQLite schema (`graph.sqlite`)
+
+| Table | Purpose |
+|-------|---------|
+| `sources` | Ingested source files with content hashes |
+| `entities` | First-class typed entities (person, project, place, ...) |
+| `entity_aliases` | Name variants per entity for search resolution |
+| `pages` | Wiki pages with optional `entity_id` FK |
+| `claims` | Confidence-scored, typed claims (`fact`, `status`, `preference`, ...) |
+| `claim_sources` | Claim ↔ source provenance |
+| `claim_dependencies` | Logical claim dependencies |
+| `claim_contradictions` | Claim contradictions |
+| `relations` | Typed edges between entities with temporal validity |
+| `epistemic_events` | Belief change timeline |
+| `embeddings` | Vector embeddings for hybrid search |
+| `compiled_views` | Pre-computed entity views with staleness tracking |
+| `entity_state_log` | World-state change history |
+| `pending_aliases` | Unresolved alias candidates for review |
+| `page_links` | Legacy page-level links |
+| `claims_fts` / `pages_fts` | FTS5 indexes |
+
 ## Configuration
 
 Project settings live in **`.quicky/config.yaml`** (JSON syntax is fine). Besides `llm`, `paths`, and `metabolism`, you can set optional **`kindRules`**, **`entityPrompts`**, **`primaryPageTitleRules`**, **`author`**, **`defaultQualityTier`**, and **`qualityWeights`** — see the type definitions in the library or your project’s config for examples.
+
+### Hybrid search (`retrieval`)
+
+Enable optional embedding-based search for semantic retrieval alongside FTS5:
+
+```yaml
+retrieval:
+  hybridSearch: true                      # enable hybrid FTS + vector search
+  embeddingModel: text-embedding-3-small  # default model
+  # Ranking weights (must sum to ~1.0):
+  wFts: 0.35      # lexical precision
+  wVec: 0.35      # semantic recall
+  wConf: 0.15     # prefer high-confidence claims
+  wRec: 0.10      # prefer recently reinforced
+  wType: 0.05     # boost entity matches
+```
+
+Requires an OpenAI API key (`OPENAI_API_KEY`) for embedding generation. Without it, the system gracefully falls back to FTS5-only — the Ask Wiki retrieval debug pill shows the active strategy.
 
 ### Primary page titles (`primaryPageTitleRules`)
 

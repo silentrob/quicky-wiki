@@ -1,17 +1,33 @@
 import type { KnowledgeStore } from "./store.js";
-import type { LLMAdapter } from "../types.js";
+import type { LLMAdapter, QuickyConfig } from "../types.js";
 import { parseLLMJson } from "../llm/parse-json.js";
+import { hybridSearch, type RetrievalMeta } from "../embeddings/hybrid-search.js";
+
+export interface QueryResult {
+  answer: string;
+  claimIds: string[];
+  confidence: number;
+  retrieval: RetrievalMeta;
+}
 
 export async function queryKnowledge(
   store: KnowledgeStore,
   llm: LLMAdapter,
   question: string,
-): Promise<{ answer: string; claimIds: string[]; confidence: number }> {
-  // Use FTS5 search to find relevant content instead of loading everything
-  const { pages: relevantPages, claims: relevantClaims } = store.search(
-    question,
-    50,
-  );
+  config?: QuickyConfig,
+): Promise<QueryResult> {
+  const useHybrid = !!(config && config.retrieval?.hybridSearch);
+  const t0 = Date.now();
+
+  const searchResult = useHybrid
+    ? await hybridSearch(store, question, 50, config!)
+    : store.search(question, 50);
+
+  const searchMs = Date.now() - t0;
+  const { pages: relevantPages, claims: relevantClaims, relations } = searchResult;
+  const hybridMeta = "meta" in searchResult
+    ? (searchResult as any).meta as RetrievalMeta
+    : undefined;
 
   // Build context from search results, grouped by page
   const pageMap = new Map<
@@ -45,6 +61,11 @@ export async function queryKnowledge(
     }
   }
 
+  const totalClaimsInContext = [...pageMap.values()].reduce(
+    (n, g) => n + g.claims.length,
+    0,
+  );
+
   const context = [...pageMap.entries()]
     .map(([, { title, claims }]) => {
       if (claims.length === 0) return "";
@@ -59,14 +80,34 @@ export async function queryKnowledge(
     .filter(Boolean)
     .join("\n\n");
 
+  const relationContext =
+    relations.length > 0
+      ? `\n\n## Graph context (typed entity relations)\n${relations
+          .map(
+            (r) =>
+              `- ${r.from.name} (${r.from.type}) —[${r.relation_type}]→ ${r.to.name} (${r.to.type})`,
+          )
+          .join("\n")}`
+      : "";
+
+  const today = new Date().toLocaleDateString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  const llmT0 = Date.now();
   const response = await llm.chat(
     [
       {
         role: "system",
-        content: `You are a knowledge assistant answering questions from a personal knowledge base. 
+        content: `You are a knowledge assistant answering questions from a personal knowledge base.
+Today's date is ${today}.
 Each claim has a confidence score. Cite specific claims and their confidence levels.
 If the knowledge base doesn't contain enough information, say so clearly.
 Always be epistemically honest about uncertainty.
+When answering questions about ages, durations, or time-relative facts, use today's date for calculations.
 
 Respond in JSON format:
 {
@@ -78,11 +119,47 @@ Respond in JSON format:
       },
       {
         role: "user",
-        content: `Knowledge base contents:\n\n${context}\n\nQuestion: ${question}`,
+        content: `Knowledge base contents:\n\n${context}${relationContext}\n\nQuestion: ${question}`,
       },
     ],
     { temperature: 0.3 },
   );
+  const llmMs = Date.now() - llmT0;
+
+  const claimTypes: Record<string, number> = {};
+  for (const c of relevantClaims) {
+    const t = (c as any).claimType || "unknown";
+    claimTypes[t] = (claimTypes[t] || 0) + 1;
+  }
+  const entityTypes: Record<string, number> = {};
+  for (const p of relevantPages) {
+    const full = store.getPage(p.id);
+    if (full?.entityId) {
+      const kind = (full as any).kind || "unknown";
+      entityTypes[kind] = (entityTypes[kind] || 0) + 1;
+    }
+  }
+
+  const retrieval: RetrievalMeta = {
+    strategy: hybridMeta?.strategy ?? "fts5",
+    pagesFound: relevantPages.length,
+    claimsCandidates: relevantClaims.length,
+    claimsInContext: totalClaimsInContext,
+    relationsFound: relations.length,
+    searchMs,
+    llmMs,
+    claimTypes: Object.keys(claimTypes).length ? claimTypes : undefined,
+    entityTypes: Object.keys(entityTypes).length ? entityTypes : undefined,
+    ...(hybridMeta?.embeddingsIndexed != null && {
+      embeddingsIndexed: hybridMeta.embeddingsIndexed,
+    }),
+    ...(hybridMeta?.embeddingModel && {
+      embeddingModel: hybridMeta.embeddingModel,
+    }),
+    ...(hybridMeta?.vectorCandidates != null && {
+      vectorCandidates: hybridMeta.vectorCandidates,
+    }),
+  };
 
   try {
     const parsed = parseLLMJson(response.content);
@@ -95,12 +172,14 @@ Respond in JSON format:
           : ""),
       claimIds: parsed.relevantClaimIds ?? [],
       confidence: parsed.overallConfidence ?? 0.5,
+      retrieval,
     };
   } catch {
     return {
       answer: response.content,
       claimIds: [],
       confidence: 0.5,
+      retrieval,
     };
   }
 }

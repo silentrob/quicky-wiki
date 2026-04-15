@@ -7,7 +7,7 @@
  */
 
 // Core store
-export { KnowledgeStore } from "./graph/store.js";
+export { KnowledgeStore, ENTITY_PAGE_KINDS } from "./graph/store.js";
 
 // Query engine
 export { queryKnowledge } from "./graph/query.js";
@@ -18,7 +18,13 @@ export {
   inferPageKind,
   resolvePrimaryPageTitle,
 } from "./compiler/ingest.js";
-export type { IngestSourceOptions, IngestProgress } from "./compiler/ingest.js";
+export type {
+  IngestSourceOptions,
+  IngestProgress,
+  IngestResult,
+} from "./compiler/ingest.js";
+export { ensureCompiledView } from "./compiler/views.js";
+export { compileRelationsFromClaims } from "./compiler/relation-compiler.js";
 
 // Knowledge resolution (summaries, page rendering)
 export { resolveKnowledge, generatePageSummaries } from "./compiler/resolve.js";
@@ -29,7 +35,12 @@ export { createLLMAdapter } from "./llm/adapter.js";
 export type { AdapterConfig } from "./llm/adapter.js";
 
 // Config helpers
-export { DEFAULT_CONFIG } from "./types.js";
+export {
+  DEFAULT_CONFIG,
+  normalizeClaimType,
+  CLAIM_TYPES,
+  COMPILED_VIEW_TYPES,
+} from "./types.js";
 
 // Types
 export type {
@@ -37,7 +48,10 @@ export type {
   PrimaryPageTitleRule,
   QuickyConfig,
   WikiPage,
+  Entity,
+  KnowledgeRelation,
   Claim,
+  ClaimType,
   Source,
   EpistemicEvent,
   EpistemicEventType,
@@ -49,4 +63,7 @@ export type {
   LLMProvider,
   SourceType,
   QualityTier,
+  CompiledViewType,
+  CompiledView,
+  EntityStateChange,
 } from "./types.js";
