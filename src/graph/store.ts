@@ -76,6 +76,56 @@ function deepMerge(
   return result;
 }
 
+/** Lowercase, trim, collapse internal whitespace for fuzzy name comparison. */
+function normalizeEntityNameForFuzzy(s: string): string {
+  return s
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/** Dice coefficient on character bigrams (0..1). Empty / single-char strings → 0. */
+function diceBigram(a: string, b: string): number {
+  const na = normalizeEntityNameForFuzzy(a);
+  const nb = normalizeEntityNameForFuzzy(b);
+  if (na.length < 2 || nb.length < 2) return na === nb ? 1 : 0;
+  const bigrams = (t: string) => {
+    const out = new Map<string, number>();
+    for (let i = 0; i < t.length - 1; i++) {
+      const bg = t.slice(i, i + 2);
+      out.set(bg, (out.get(bg) ?? 0) + 1);
+    }
+    return out;
+  };
+  const A = bigrams(na);
+  const B = bigrams(nb);
+  let inter = 0;
+  for (const [bg, ca] of A) {
+    const cb = B.get(bg);
+    if (cb) inter += Math.min(ca, cb);
+  }
+  const total = na.length - 1 + (nb.length - 1);
+  return total > 0 ? (2 * inter) / total : 0;
+}
+
+/**
+ * Fuzzy similarity score for entity names (same-type candidates only).
+ * Returns null if below match threshold.
+ */
+function fuzzyEntityNameScore(a: string, b: string): number | null {
+  const na = normalizeEntityNameForFuzzy(a);
+  const nb = normalizeEntityNameForFuzzy(b);
+  if (!na || !nb) return null;
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return 0.92;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  if (shorter.length >= 3 && longer.startsWith(shorter)) return 0.88;
+  const dice = diceBigram(na, nb);
+  if (dice >= 0.6) return dice;
+  return null;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sources (
   id TEXT PRIMARY KEY,
@@ -437,6 +487,18 @@ export class KnowledgeStore {
     }
   }
 
+  /** Claims attached to pages linked to this entity (for fuzzy tie-break). */
+  countClaimsForEntity(entityId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM claims c
+         INNER JOIN pages p ON c.page_id = p.id
+         WHERE p.entity_id = ?`,
+      )
+      .get(entityId) as { c: number };
+    return row?.c ?? 0;
+  }
+
   /** Create or attach entity for a typed primary page row (no entity_id). */
   private linkPageToNewOrExistingEntity(pageRow: any): void {
     const title = pageRow.title as string;
@@ -445,9 +507,64 @@ export class KnowledgeStore {
     const now = new Date().toISOString();
     let entityId = (
       this.db
-        .prepare("SELECT id FROM entities WHERE canonical_name = ?")
+        .prepare(
+          "SELECT id FROM entities WHERE canonical_name = ? COLLATE NOCASE",
+        )
         .get(title) as { id: string } | undefined
     )?.id;
+
+    if (!entityId) {
+      const aliasHit = this.db
+        .prepare(
+          `SELECT e.id FROM entity_aliases ea
+           INNER JOIN entities e ON e.id = ea.entity_id
+           WHERE ea.alias = ? COLLATE NOCASE AND e.type = ?`,
+        )
+        .get(title, kind) as { id: string } | undefined;
+      entityId = aliasHit?.id;
+    }
+
+    if (!entityId) {
+      const candidates = this.db
+        .prepare(`SELECT id, canonical_name FROM entities WHERE type = ?`)
+        .all(kind) as { id: string; canonical_name: string }[];
+
+      let best: { id: string; score: number; claims: number } | null = null;
+      for (const c of candidates) {
+        const score = fuzzyEntityNameScore(title, c.canonical_name);
+        if (score == null) continue;
+        const claims = this.countClaimsForEntity(c.id);
+        if (
+          !best ||
+          score > best.score ||
+          (score === best.score && claims > best.claims)
+        ) {
+          best = { id: c.id, score, claims };
+        }
+      }
+
+      if (best) {
+        entityId = best.id;
+        this.addEntityAlias(entityId, title);
+        this.logEntityStateChange(
+          entityId,
+          "auto_resolved_alias",
+          null,
+          {
+            surface: title,
+            matchedCanonical: (
+              this.db
+                .prepare("SELECT canonical_name FROM entities WHERE id = ?")
+                .get(entityId) as { canonical_name: string }
+            ).canonical_name,
+            method: "fuzzy_name",
+            score: best.score,
+          },
+          null,
+        );
+      }
+    }
+
     if (!entityId) {
       entityId = randomUUID();
       this.db
@@ -757,7 +874,9 @@ export class KnowledgeStore {
 
   getEntityByCanonicalName(name: string): Entity | null {
     const row = this.db
-      .prepare("SELECT * FROM entities WHERE canonical_name = ?")
+      .prepare(
+        "SELECT * FROM entities WHERE canonical_name = ? COLLATE NOCASE",
+      )
       .get(name) as any;
     return row ? this.rowToEntity(row) : null;
   }
@@ -970,10 +1089,169 @@ export class KnowledgeStore {
       .run(entityId, a);
   }
 
+  /**
+   * Merge `loserId` into `winnerId`: re-point pages and relations, deep-merge metadata
+   * (winner values win on conflict), move aliases, remove loser. Same `type` required.
+   */
+  mergeEntities(winnerId: string, loserId: string): void {
+    if (winnerId === loserId) return;
+    const w = this.getEntity(winnerId);
+    const l = this.getEntity(loserId);
+    if (!w || !l) {
+      throw new Error("mergeEntities: winner or loser entity not found");
+    }
+    if (w.type !== l.type) {
+      throw new Error(
+        `mergeEntities: type mismatch (${w.type} vs ${l.type}); cross-type merge not supported`,
+      );
+    }
+
+    const now = new Date().toISOString();
+    const run = this.db.transaction(() => {
+      this.db
+        .prepare(
+          "UPDATE pages SET entity_id = ?, updated_at = ? WHERE entity_id = ?",
+        )
+        .run(winnerId, now, loserId);
+
+      const rels = this.db
+        .prepare(
+          "SELECT * FROM relations WHERE from_entity_id = ? OR to_entity_id = ?",
+        )
+        .all(loserId, loserId) as any[];
+
+      this.db
+        .prepare(
+          "DELETE FROM relations WHERE from_entity_id = ? OR to_entity_id = ?",
+        )
+        .run(loserId, loserId);
+
+      for (const r of rels) {
+        const nf =
+          r.from_entity_id === loserId ? winnerId : r.from_entity_id;
+        const nt =
+          r.to_entity_id === loserId ? winnerId : r.to_entity_id;
+        if (nf === nt) continue;
+        const [fromId, toId] = canonicalRelationEndpoints(
+          nf,
+          nt,
+          r.relation_type,
+        );
+        const metaJson =
+          typeof r.metadata_json === "string"
+            ? r.metadata_json
+            : JSON.stringify(r.metadata_json ?? {});
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO relations (
+               id, from_entity_id, relation_type, to_entity_id, confidence, status,
+               valid_from, valid_to, source_claim_id, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            randomUUID(),
+            fromId,
+            r.relation_type,
+            toId,
+            r.confidence,
+            r.status ?? "active",
+            r.valid_from ?? null,
+            r.valid_to ?? null,
+            r.source_claim_id ?? null,
+            metaJson,
+            r.created_at ?? now,
+            now,
+          );
+      }
+
+      const mergedMeta = deepMerge(
+        l.metadata as Record<string, unknown>,
+        w.metadata as Record<string, unknown>,
+      );
+      this.db
+        .prepare(
+          "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(JSON.stringify(mergedMeta), now, winnerId);
+
+      this.addEntityAlias(winnerId, l.canonicalName);
+
+      const loserAliases = this.db
+        .prepare("SELECT alias FROM entity_aliases WHERE entity_id = ?")
+        .all(loserId) as { alias: string }[];
+
+      for (const row of loserAliases) {
+        this.addEntityAlias(winnerId, row.alias);
+      }
+
+      this.db
+        .prepare(
+          "DELETE FROM embeddings WHERE subject_type = 'entity' AND subject_id = ?",
+        )
+        .run(loserId);
+      this.db
+        .prepare("DELETE FROM compiled_views WHERE entity_id = ?")
+        .run(loserId);
+      this.db
+        .prepare("DELETE FROM entity_state_log WHERE entity_id = ?")
+        .run(loserId);
+
+      this.db.prepare("DELETE FROM entities WHERE id = ?").run(loserId);
+
+      this.logEntityStateChange(
+        winnerId,
+        "entity_merge",
+        null,
+        {
+          absorbedEntityId: loserId,
+          absorbedCanonicalName: l.canonicalName,
+        },
+        null,
+      );
+    });
+
+    run();
+    this.markViewsStaleForEntity(winnerId);
+  }
+
+  /** True if canonical/alias overlap already links the two entities (dedup can skip). */
+  areEntitiesAlreadyNameLinked(idA: string, idB: string): boolean {
+    const a = this.getEntity(idA);
+    const b = this.getEntity(idB);
+    if (!a || !b) return true;
+    if (a.canonicalName.toLowerCase() === b.canonicalName.toLowerCase())
+      return true;
+    const one = this.db
+      .prepare(
+        `SELECT 1 FROM entity_aliases WHERE entity_id = ? AND alias = ? COLLATE NOCASE LIMIT 1`,
+      )
+      .get(b.id, a.canonicalName);
+    if (one) return true;
+    const two = this.db
+      .prepare(
+        `SELECT 1 FROM entity_aliases WHERE entity_id = ? AND alias = ? COLLATE NOCASE LIMIT 1`,
+      )
+      .get(a.id, b.canonicalName);
+    return !!two;
+  }
+
+  /** Pending alias row already queued (avoids duplicate embedding-dedup noise). */
+  pendingAliasPairExists(surfaceForm: string, candidateEntityName: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM pending_aliases
+         WHERE surface_form = ? COLLATE NOCASE
+           AND candidate_entity_name = ? COLLATE NOCASE
+           AND status = 'pending' LIMIT 1`,
+      )
+      .get(surfaceForm.trim(), candidateEntityName.trim());
+    return !!row;
+  }
+
   addPendingAlias(opts: {
     surfaceForm: string;
     candidateEntityName: string;
-    sourceId: string;
+    sourceId?: string | null;
   }): void {
     const sf = opts.surfaceForm.trim();
     const cn = opts.candidateEntityName.trim();
@@ -983,7 +1261,13 @@ export class KnowledgeStore {
         `INSERT INTO pending_aliases (id, surface_form, candidate_entity_name, source_id, status, created_at)
          VALUES (?, ?, ?, ?, 'pending', ?)`,
       )
-      .run(randomUUID(), sf, cn, opts.sourceId, new Date().toISOString());
+      .run(
+        randomUUID(),
+        sf,
+        cn,
+        opts.sourceId ?? null,
+        new Date().toISOString(),
+      );
   }
 
   listPendingAliases(): Array<{
@@ -1018,7 +1302,23 @@ export class KnowledgeStore {
     if (!row) return false;
     const ent = this.getEntityByCanonicalName(row.candidate_entity_name);
     if (!ent) return false;
-    this.addEntityAlias(ent.id, row.surface_form);
+
+    const dup = this.db
+      .prepare(
+        `SELECT id FROM entities WHERE canonical_name = ? COLLATE NOCASE AND type = ? AND id != ?`,
+      )
+      .get(row.surface_form, ent.type, ent.id) as { id: string } | undefined;
+
+    if (dup) {
+      const wClaims = this.countClaimsForEntity(ent.id);
+      const lClaims = this.countClaimsForEntity(dup.id);
+      const [winnerId, loserId] =
+        wClaims >= lClaims ? [ent.id, dup.id] : [dup.id, ent.id];
+      this.mergeEntities(winnerId, loserId);
+    } else {
+      this.addEntityAlias(ent.id, row.surface_form);
+    }
+
     this.db
       .prepare("UPDATE pending_aliases SET status = 'confirmed' WHERE id = ?")
       .run(id);

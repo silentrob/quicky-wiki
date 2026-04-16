@@ -329,6 +329,8 @@ export interface QuickyConfig {
     wConf?: number;
     wRec?: number;
     wType?: number;
+    /** After embedding sync, queue high-similarity entity pairs into pending_aliases for review. */
+    autoDedup?: boolean;
   };
 }
 

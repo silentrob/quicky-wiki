@@ -274,6 +274,16 @@ retrieval:
 
 Requires an OpenAI API key (`OPENAI_API_KEY`) for embedding generation. Without it, the system gracefully falls back to FTS5-only — the Ask Wiki retrieval debug pill shows the active strategy.
 
+Optional: **`autoDedup: true`** — after each embedding sync, enqueue high-similarity same-type entity pairs into the **Review Queue** (`pending_aliases`) for confirmation (confirming runs a full merge when the surface form is another entity’s canonical name).
+
+Retroactive cleanup:
+
+```bash
+qw dedup-entities              # interactive: merge pairs (embedding similarity)
+qw dedup-entities --dry-run
+qw dedup-entities --auto-merge --threshold 0.92
+```
+
 ### Primary page titles (`primaryPageTitleRules`)
 
 When ingesting a source, Quicky syncs a **primary wiki page** for that file’s entity (`kind` + frontmatter metadata). By default the page title is **`name` → `title` → filename stem**, which can collide if two files share a stem but represent different entity kinds (e.g. a person note and a relationship note both named `Jane.md`).

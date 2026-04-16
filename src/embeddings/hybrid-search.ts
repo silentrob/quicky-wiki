@@ -31,7 +31,7 @@ interface HybridResult {
   meta: RetrievalMeta;
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   let dot = 0;
   let na = 0;
   let nb = 0;

@@ -5,6 +5,7 @@ import {
   fetchOpenAIEmbedding,
   resolveOpenAIKeyForEmbeddings,
 } from "./openai-embed.js";
+import { queueEntityDuplicatesAsPending } from "./dedup.js";
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -83,5 +84,14 @@ export async function syncEmbeddings(
       vector: vec,
       textHash: hash,
     });
+  }
+
+  if (config.retrieval?.autoDedup) {
+    const n = queueEntityDuplicatesAsPending(store, config);
+    if (n > 0) {
+      console.log(
+        `[embeddings] Queued ${n} duplicate entity pair(s) for review (pending aliases).`,
+      );
+    }
   }
 }

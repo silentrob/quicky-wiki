@@ -11,6 +11,7 @@ import { lintCommand } from "./cli/lint.js";
 import { startDashboard } from "./cli/serve.js";
 import { watchCommand } from "./cli/watch.js";
 import { pruneTopicsCommand } from "./cli/prune-topics.js";
+import { dedupEntitiesCommand } from "./cli/dedup-entities.js";
 import { createQuickyWiki } from "./cli/create.js";
 import { startMCPServer } from "./mcp/server.js";
 import {
@@ -27,7 +28,7 @@ program
   .description(
     "Quicky Wiki — LLM-powered knowledge compiler with temporal tracking",
   )
-  .version("0.2.0");
+  .version("0.3.0");
 
 program
   .command("init")
@@ -133,6 +134,20 @@ program
     "Delete topic pages with no claims (keeps person/project/etc.), re-render wiki",
   )
   .action(pruneTopicsCommand);
+
+program
+  .command("dedup-entities")
+  .description(
+    "Find duplicate entities via embedding similarity; merge or queue for review",
+  )
+  .option(
+    "--threshold <n>",
+    "Cosine similarity threshold (0-1, default: 0.92)",
+    "0.92",
+  )
+  .option("--auto-merge", "Merge each pair (more claims wins) without prompts")
+  .option("--dry-run", "Print candidates only")
+  .action(dedupEntitiesCommand);
 
 program
   .command("watch")
