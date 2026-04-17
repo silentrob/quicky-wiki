@@ -301,16 +301,24 @@ interface ExtractedClaim {
 }
 
 function entityMetadataSchemaHint(kind: string): string {
+  const preamble = `IMPORTANT: Do NOT put relationship-like data in "entity_metadata". Connections between entities (employer, team membership, reports-to, located-in, depends-on, collaborates-with, etc.) belong in claims with claim_type "attribute" — they will be extracted as graph relations in a later pass. "entity_metadata" is only for scalar properties intrinsic to this single entity that cannot be expressed as a relation edge.\n`;
   switch (kind) {
     case "person":
-      return `Use "entity_metadata" with: roles (string[]), organizations (string[]), relationship_type (string), importance (string), cadence (string), last_contact (string|null), active_topics (string[]), notable_dates (object of string keys to ISO date strings). Omit keys you cannot infer.`;
+      return preamble + `Use "entity_metadata" with: importance (string), cadence (string), last_contact (string|null), active_topics (string[]), notable_dates (object of string keys to ISO date strings). Omit keys you cannot infer. Do NOT include organizations, roles, or relationship_type here — express those as "attribute" claims instead.`;
     case "project":
-      return `Use "entity_metadata" with: status (string), priority (string), mode (string), stakeholders (string[]), dependencies (string[]), milestones (array of {name, status, date?}). Omit keys you cannot infer.`;
-    case "organization":
+      return preamble + `Use "entity_metadata" with: status (string), priority (string), mode (string), milestones (array of {name, status, date?}). Omit keys you cannot infer. Do NOT include stakeholders or dependencies here — express those as "attribute" claims instead.`;
     case "place":
+      return (
+        preamble +
+        `For place entities, include location in both forms when the source gives enough detail (omit either form if unknown):\n` +
+        `- coordinates_decimal: { "latitude": <number>, "longitude": <number> } in WGS84 (decimal degrees; use negative longitude for west of prime meridian, negative latitude for south).\n` +
+        `- coordinates_dms: { "latitude": "<deg>° <min>' <sec>\" <N|S>", "longitude": "<deg>° <min>' <sec>\" <E|W>" } matching the same point as coordinates_decimal when both are present.\n` +
+        `Also use "entity_metadata" for other intrinsic fields: region (string), timezone (string), elevation_m (number|null), notes (string). Do NOT include links to other entities — express those as "attribute" claims instead.`
+      );
+    case "organization":
     case "life_area":
     case "relationship":
-      return `Use "entity_metadata" with flat string or string[] fields that describe this ${kind} usefully (e.g. region, sector, notes).`;
+      return preamble + `Use "entity_metadata" with flat string or string[] fields that describe intrinsic properties of this ${kind} (e.g. region, sector, founding date). Do NOT include links to other entities — express those as "attribute" claims instead.`;
     default:
       return "";
   }
@@ -435,6 +443,10 @@ For each claim, set claim_type to exactly one of: fact, observation, preference,
   - hypothesis: inferred pattern, testable
   - status: current state of something
   - attribute: structured entity property (roles, dates, relationship labels)
+
+IMPORTANT — prefer "attribute" claims over entity_metadata for anything that links two entities:
+  Connections like "works at Acme", "member of Team X", "reports to Jane", "located in NYC", or "depends on Project Y" MUST be extracted as claims (claim_type "attribute"), NOT stuffed into entity_metadata. A later pass converts these into typed graph relation edges. Reserve entity_metadata for scalar properties intrinsic to a single entity (e.g. importance, cadence, founding date).
+
 Tag each claim with relevant topic tags.
 Identify related concepts (potential wiki page titles) for cross-linking.
 If a claim logically depends on another claim you're extracting, note the dependency.${authorExtra}${extra}${metaHint}

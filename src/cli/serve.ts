@@ -105,6 +105,7 @@ export function startDashboard(
             json(res, { error: "Not found" }, 404);
             return;
           }
+          const summaryView = store.getCompiledView(id, "summary");
           json(res, {
             entity: {
               id: detail.entity.id,
@@ -116,6 +117,9 @@ export function startDashboard(
             aliases: detail.aliases,
             primaryPageId: detail.primaryPage?.id ?? null,
             primaryPageTitle: detail.primaryPage?.title ?? null,
+            summary: summaryView
+              ? { body: summaryView.body, stale: summaryView.stale }
+              : null,
             claims: detail.claims.map((c) => ({
               id: c.id,
               statement: c.statement,
@@ -236,6 +240,19 @@ export function startDashboard(
           if (existsSync(wikiPath)) {
             markdown = await readFile(wikiPath, "utf-8");
           }
+          let entityRelations: any[] = [];
+          let entityInfo: { id: string; canonicalName: string; type: string } | null = null;
+          if (full.page.entityId) {
+            const detail = store.getEntityDetail(full.page.entityId);
+            if (detail) {
+              entityInfo = {
+                id: detail.entity.id,
+                canonicalName: detail.entity.canonicalName,
+                type: detail.entity.type,
+              };
+              entityRelations = detail.relations;
+            }
+          }
           json(res, {
             ...full.page,
             claims: full.claims.map((c: any) => ({
@@ -243,6 +260,8 @@ export function startDashboard(
               sources: c.sourceCount,
             })),
             linkedPages,
+            entityRelations,
+            entityInfo,
             markdown,
           });
         } else if (url.pathname === "/api/claims") {
@@ -911,13 +930,21 @@ async function openPage(pageId){
   if(hasSummary)html+='<div class="slideOver-section"><h3>Summary</h3><p style="font-size:13px;color:var(--text-dim)">'+esc(page.summary)+'</p></div>';
   if(hasClaims){
     html+='<div class="slideOver-section"><h3>Claims ('+page.claims.length+')</h3>';
-    html+=page.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+'<div style="flex:1"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px">'+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div><button class="del-page-claim" data-claim-id="'+c.id+'" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:13px;padding:2px 6px;border-radius:4px;flex-shrink:0" title="Delete claim">✕</button></div>').join('');
+    html+=page.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+claimTypeBadge(c.claimType||'fact')+'<div style="flex:1"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px">'+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div><button class="del-page-claim" data-claim-id="'+c.id+'" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:13px;padding:2px 6px;border-radius:4px;flex-shrink:0" title="Delete claim">✕</button></div>').join('');
     html+='</div>';
+  }
+  if(page.entityRelations&&page.entityRelations.length){
+    html+='<div class="slideOver-section"><h3>Relations ('+page.entityRelations.length+')</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
+    html+=page.entityRelations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong class="entity-chip" data-entity-id="'+esc(r.otherEntityId)+'" style="cursor:pointer">'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
+    html+='</ul></div>';
   }
   if(hasLinks){
     html+='<div class="slideOver-section"><h3>Linked Pages ('+page.linkedPages.length+')</h3><div>';
     html+=page.linkedPages.map(p=>'<span class="linked-page-chip" data-page-id="'+p.id+'">'+esc(p.title)+'</span>').join('');
     html+='</div></div>';
+  }
+  if(page.entityInfo){
+    html+='<div class="slideOver-section"><h3>Entity</h3><div><span class="entity-chip" data-entity-id="'+esc(page.entityInfo.id)+'" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);font-size:13px"><strong>'+esc(page.entityInfo.canonicalName)+'</strong><code style="font-size:11px">'+esc(page.entityInfo.type)+'</code></span></div></div>';
   }
   if(page.markdown)html+='<div class="slideOver-section"><div class="md-content">'+renderMarkdown(page.markdown)+'</div></div>';
   const sparse=!hasSummary&&!hasClaims&&!hasLinks&&!hasMd;
@@ -967,6 +994,32 @@ async function openSource(sourceId){
 function confBadge(val){const pct=(val*100).toFixed(0)+'%';if(val>=0.8)return'<span class="badge badge-green">'+pct+'</span>';if(val>=0.4)return'<span class="badge badge-yellow">'+pct+'</span>';return'<span class="badge badge-red">'+pct+'</span>';}
 function relTime(iso){if(!iso)return'';const diff=Date.now()-new Date(iso).getTime();if(diff<3600000)return Math.floor(diff/60000)+'m ago';if(diff<86400000)return Math.floor(diff/3600000)+'h ago';return Math.floor(diff/86400000)+'d ago';}
 function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';}
+function formatEntityLocationHtml(meta){
+  if(!meta||typeof meta!=='object')return '';
+  const dec=meta.coordinates_decimal;
+  const dms=meta.coordinates_dms;
+  let lat=null,lng=null;
+  if(dec&&typeof dec==='object'){
+    const la=dec.latitude,lo=dec.longitude;
+    if(typeof la==='number'&&typeof lo==='number'){lat=la;lng=lo;}
+    else if(typeof la==='string'&&typeof lo==='string'){const a=parseFloat(la),b=parseFloat(lo);if(!isNaN(a)&&!isNaN(b)){lat=a;lng=b;}}
+  }
+  let dmsLat='',dmsLng='';
+  if(dms&&typeof dms==='object'){
+    if(dms.latitude!=null)dmsLat=String(dms.latitude);
+    if(dms.longitude!=null)dmsLng=String(dms.longitude);
+  }
+  if(lat==null&&lng==null&&!dmsLat&&!dmsLng)return '';
+  let h='<div class="slideOver-section"><h3>Location</h3>';
+  if(lat!=null&&lng!=null){
+    h+='<p style="font-size:13px;margin:0 0 8px 0;line-height:1.45"><strong>Decimal (WGS84):</strong> '+lat.toFixed(6)+', '+lng.toFixed(6);
+    const enc='https://www.openstreetmap.org/?mlat='+encodeURIComponent(String(lat))+'&mlon='+encodeURIComponent(String(lng))+'#map=15/'+encodeURIComponent(String(lat))+'/'+encodeURIComponent(String(lng));
+    h+=' <a href="'+enc+'" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:12px;margin-left:8px">Open map ↗</a></p>';
+  }
+  if(dmsLat||dmsLng)h+='<p style="font-size:13px;margin:0;color:var(--text-dim);line-height:1.45"><strong>DMS:</strong> '+(dmsLat?esc(dmsLat):'—')+(dmsLat&&dmsLng?' · ':'')+(dmsLng?esc(dmsLng):'')+'</p>';
+  h+='</div>';
+  return h;
+}
 function claimTypeBadge(t){
   const k=String(t||'fact');
   const map={fact:'#78716C',observation:'#0EA5E9',preference:'#16A34A',hypothesis:'#A855F7',status:'#CA8A04',attribute:'#6366F1'};
@@ -1139,18 +1192,20 @@ async function openEntity(entityId){
   if(d.error){alert(d.error);return;}
   const meta=JSON.stringify(d.entity.metadata||{},null,2);
   let html='<div class="slideOver-section"><h3>'+esc(d.entity.canonicalName)+'</h3><p style="font-size:12px;color:var(--text-dim)"><code>'+esc(d.entity.type)+'</code> · '+esc(d.entity.status)+'</p></div>';
-  if(d.aliases&&d.aliases.length)html+='<div class="slideOver-section"><h3>Aliases</h3><p style="font-size:13px">'+d.aliases.map(a=>'<code style="margin-right:6px">'+esc(a)+'</code>').join('')+'</p></div>';
+  html+=formatEntityLocationHtml(d.entity.metadata);
+  if(d.summary&&d.summary.body)html+='<div class="slideOver-section"><h3>Summary'+(d.summary.stale?' <span style="font-size:10px;font-weight:400;color:var(--yellow);margin-left:6px">stale</span>':'')+'</h3><p style="font-size:13px;color:var(--text-dim);line-height:1.5;white-space:pre-wrap">'+esc(d.summary.body)+'</p></div>';
   if(d.relations&&d.relations.length){
-    html+='<div class="slideOver-section"><h3>Relations</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
-    html+=d.relations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong>'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
+    html+='<div class="slideOver-section"><h3>Relations ('+d.relations.length+')</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
+    html+=d.relations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong class="entity-chip" data-entity-id="'+esc(r.otherEntityId)+'" style="cursor:pointer">'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
     html+='</ul></div>';
   }
-  html+='<div class="slideOver-section"><h3>Metadata</h3><pre style="font-size:11px;overflow:auto;max-height:180px;background:var(--surface);padding:10px;border-radius:6px">'+esc(meta)+'</pre></div>';
   if(d.claims&&d.claims.length){
     html+='<div class="slideOver-section"><h3>Claims ('+d.claims.length+')</h3>';
     html+=d.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+claimTypeBadge(c.claimType||'fact')+'<div style="flex:1;font-size:13px">'+esc(c.statement)+'</div></div>').join('');
     html+='</div>';
   }
+  if(d.aliases&&d.aliases.length)html+='<div class="slideOver-section"><h3>Aliases</h3><p style="font-size:13px">'+d.aliases.map(a=>'<code style="margin-right:6px">'+esc(a)+'</code>').join('')+'</p></div>';
+  html+='<div class="slideOver-section"><details><summary style="cursor:pointer;font-weight:600;font-size:14px">Metadata</summary><pre style="font-size:11px;overflow:auto;max-height:180px;background:var(--surface);padding:10px;border-radius:6px;margin-top:8px">'+esc(meta)+'</pre></details></div>';
   html+='<div class="slideOver-section"><h3>Compiled views</h3><p style="font-size:12px;color:var(--text-dim)">Cached LLM summaries (regenerate on demand).</p>';
   html+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0">';
   [['summary','Summary'],['agent_context','Agent ctx'],['status_card','Status'],['briefing','Briefing']].forEach(function(p){html+='<button type="button" class="cv-load" data-vt="'+p[0]+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">'+p[1]+'</button>';});
