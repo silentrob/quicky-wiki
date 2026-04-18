@@ -15,11 +15,13 @@ export { queryKnowledge } from "./graph/query.js";
 // Ingest pipeline
 export {
   ingestSource,
+  ingestRawMarkdown,
   inferPageKind,
   resolvePrimaryPageTitle,
 } from "./compiler/ingest.js";
 export type {
   IngestSourceOptions,
+  IngestRawMarkdownOptions,
   IngestProgress,
   IngestResult,
 } from "./compiler/ingest.js";
@@ -56,6 +58,7 @@ export type {
   EpistemicEvent,
   EpistemicEventType,
   KnowledgeDiff,
+  ResolveKnowledgeContext,
   LLMAdapter,
   LLMMessage,
   LLMResponse,

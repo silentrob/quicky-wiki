@@ -28,7 +28,7 @@ program
   .description(
     "Quicky Wiki — LLM-powered knowledge compiler with temporal tracking",
   )
-  .version("0.3.0");
+  .version("0.3.3");
 
 program
   .command("init")

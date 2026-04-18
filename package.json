@@ -1,6 +1,6 @@
 {
   "name": "quicky-wiki",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "An LLM-powered knowledge compiler with temporal tracking, confidence scoring, and multi-target compilation",
   "type": "module",
   "main": "./dist/lib.js",
@@ -22,6 +22,8 @@
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -38,7 +40,8 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.0",
     "tsup": "^8.4.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.9"
   },
   "engines": {
     "node": ">=20"

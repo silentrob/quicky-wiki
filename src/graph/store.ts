@@ -1062,6 +1062,44 @@ export class KnowledgeStore {
     return row?.id ?? null;
   }
 
+  /**
+   * Batch-load aliases for many entities (one query). Values are ordered by alias.
+   */
+  listAliasesForEntities(entityIds: string[]): Map<string, string[]> {
+    const m = new Map<string, string[]>();
+    if (entityIds.length === 0) return m;
+    const placeholders = entityIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT entity_id, alias FROM entity_aliases WHERE entity_id IN (${placeholders}) ORDER BY entity_id, alias`,
+      )
+      .all(...entityIds) as { entity_id: string; alias: string }[];
+    for (const r of rows) {
+      const list = m.get(r.entity_id) ?? [];
+      list.push(r.alias);
+      m.set(r.entity_id, list);
+    }
+    return m;
+  }
+
+  /**
+   * Primary page summaries keyed by entity_id (first matching page per entity).
+   */
+  getPrimaryPageSummariesByEntityId(entityIds: string[]): Map<string, string> {
+    const m = new Map<string, string>();
+    if (entityIds.length === 0) return m;
+    const placeholders = entityIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT entity_id, summary FROM pages WHERE entity_id IN (${placeholders}) AND summary IS NOT NULL AND TRIM(summary) != ''`,
+      )
+      .all(...entityIds) as { entity_id: string; summary: string }[];
+    for (const r of rows) {
+      if (!m.has(r.entity_id)) m.set(r.entity_id, r.summary);
+    }
+    return m;
+  }
+
   private rowToRelation(row: any): KnowledgeRelation {
     return {
       id: row.id,

@@ -1,13 +1,22 @@
 import type { KnowledgeStore } from "../graph/store.js";
-import type { LLMAdapter, Source, KnowledgeDiff, QuickyConfig } from "../types.js";
+import type {
+  LLMAdapter,
+  Source,
+  KnowledgeDiff,
+  QuickyConfig,
+  ResolveKnowledgeContext,
+} from "../types.js";
 import { propagateCascade } from "../graph/cascade.js";
 import { parseLLMJson } from "../llm/parse-json.js";
+import { buildGroundedEntityCatalogForAssignment } from "./entity-assignment-catalog.js";
+
 export async function resolveKnowledge(
   store: KnowledgeStore,
   llm: LLMAdapter,
   diff: KnowledgeDiff,
   source: Source,
   config?: QuickyConfig,
+  resolveContext?: ResolveKnowledgeContext,
 ): Promise<{ relationsCompiled: number }> {
   let relationsCompiled = 0;
   // 1. Reinforce existing claims
@@ -65,34 +74,63 @@ export async function resolveKnowledge(
 
   // 4. Add new claims + create page links between claim pages
   const claimPageIds: string[] = [];
-  // Batch assign claims to pages (8 at a time = 1 LLM call each batch)
   const batchSize = 8;
+  const useEntityAssignment = store.listEntities().length > 0;
+
   for (let i = 0; i < diff.newClaims.length; i += batchSize) {
     const batch = diff.newClaims.slice(i, i + batchSize);
-    const assignments = await batchAssignClaimsToPages(llm, batch.map((nc) => nc.statement), store);
-    for (let j = 0; j < batch.length; j++) {
-      const nc = batch[j];
-      const pageTitle = assignments[j];
-      let page = store.getPageByTitle(pageTitle);
-      if (!page) {
-        const path = titleToPath(pageTitle);
-        try {
-          page = store.addPage(pageTitle, path);
-        } catch {
-          const existing = store.listPages().find((p) => p.path === path);
-          page = existing ?? store.addPage(pageTitle, path + "-" + Date.now() + ".md");
+    const statements = batch.map((nc) => nc.statement);
+
+    if (useEntityAssignment) {
+      const labels = await batchAssignClaimsToEntities(
+        llm,
+        statements,
+        store,
+        resolveContext,
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const nc = batch[j];
+        const label = (labels[j] ?? "").trim();
+        let pageId: string | null = label
+          ? resolveEntityLabelToPageId(store, label)
+          : null;
+        // Plan (a): non-catalog / unresolvable entity → page-title assignment for this claim only
+        if (!pageId) {
+          const titles = await batchAssignClaimsToPages(
+            llm,
+            [nc.statement],
+            store,
+          );
+          const page = ensurePageForTitle(store, titles[0]);
+          pageId = page.id;
         }
+        const claim = store.addClaim({
+          statement: nc.statement,
+          pageId,
+          confidence: nc.confidence,
+          sourceIds: [source.id],
+          tags: nc.tags ?? [],
+          claimType: nc.claimType,
+        });
+        nc.claimId = claim.id;
+        claimPageIds.push(pageId);
       }
-      const claim = store.addClaim({
-        statement: nc.statement,
-        pageId: page.id,
-        confidence: nc.confidence,
-        sourceIds: [source.id],
-        tags: nc.tags ?? [],
-        claimType: nc.claimType,
-      });
-      nc.claimId = claim.id;
-      claimPageIds.push(page.id);
+    } else {
+      const assignments = await batchAssignClaimsToPages(llm, statements, store);
+      for (let j = 0; j < batch.length; j++) {
+        const nc = batch[j];
+        const page = ensurePageForTitle(store, assignments[j]);
+        const claim = store.addClaim({
+          statement: nc.statement,
+          pageId: page.id,
+          confidence: nc.confidence,
+          sourceIds: [source.id],
+          tags: nc.tags ?? [],
+          claimType: nc.claimType,
+        });
+        nc.claimId = claim.id;
+        claimPageIds.push(page.id);
+      }
     }
   }
 
@@ -150,6 +188,135 @@ export async function resolveKnowledge(
   }
 
   return { relationsCompiled };
+}
+
+function formatResolveContextHint(ctx?: ResolveKnowledgeContext): string {
+  if (!ctx) return "";
+  const parts: string[] = [];
+  if (ctx.sourcePrimaryCanonicalName || ctx.sourcePrimaryEntityId) {
+    parts.push(
+      `This source is primarily about entity "${ctx.sourcePrimaryCanonicalName ?? "unknown"}"` +
+        (ctx.sourcePrimaryEntityId
+          ? ` (id: ${ctx.sourcePrimaryEntityId})`
+          : "") +
+        ".",
+    );
+  }
+  if (ctx.pageKind) {
+    parts.push(`Source page kind: ${ctx.pageKind}.`);
+  }
+  if (parts.length > 0) {
+    parts.push(
+      "Claims that are mainly about this primary subject should be assigned to that entity when it appears in the catalog.",
+    );
+  }
+  return parts.join(" ");
+}
+
+function resolveEntityLabelToPageId(
+  store: KnowledgeStore,
+  label: string,
+): string | null {
+  const raw = label.trim();
+  if (!raw) return null;
+  const uuidLike =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      raw,
+    );
+  if (uuidLike) {
+    const ent = store.getEntity(raw);
+    if (ent) return store.getPrimaryPageIdForEntity(ent.id);
+  }
+  const byName = store.getEntityByCanonicalName(raw);
+  if (byName) return store.getPrimaryPageIdForEntity(byName.id);
+  const byAlias = store.resolveEntityAlias(raw);
+  if (byAlias) return store.getPrimaryPageIdForEntity(byAlias);
+  return null;
+}
+
+async function batchAssignClaimsToEntities(
+  llm: LLMAdapter,
+  statements: string[],
+  store: KnowledgeStore,
+  resolveContext?: ResolveKnowledgeContext,
+): Promise<string[]> {
+  const catalog = buildGroundedEntityCatalogForAssignment(store);
+  const ctxHint = formatResolveContextHint(resolveContext);
+  const prefix = ctxHint ? `Instructions:\n${ctxHint}\n\n` : "";
+
+  if (statements.length === 1) {
+    const resp = await llm.chat(
+      [
+        {
+          role: "system",
+          content: `You assign a factual claim to the ONE entity the claim is MAINLY about. Pick only from the Entities list (match canonical name, id, or listed alias).
+Respond JSON only: { "entity": "canonical name from list", "entity_id": "optional uuid if known" }`,
+        },
+        {
+          role: "user",
+          content: `${prefix}Entities:\n${catalog}\n\nClaim:\n${statements[0]}`,
+        },
+      ],
+      { temperature: 0.2 },
+    );
+    try {
+      const parsed = parseLLMJson(resp.content);
+      const id = String(parsed.entity_id ?? "").trim();
+      const name = String(parsed.entity ?? "").trim();
+      return [id || name || ""];
+    } catch {
+      return [""];
+    }
+  }
+
+  const numberedClaims = statements.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const resp = await llm.chat(
+    [
+      {
+        role: "system",
+        content: `You assign each factual claim to the ONE entity that claim is MAINLY about. Use only entities from the catalog (canonical name, id, or listed alias).
+Respond JSON only: { "assignments": [ { "index": 1, "entity": "canonical name", "entity_id": "optional" } ] }`,
+      },
+      {
+        role: "user",
+        content: `${prefix}Entities:\n${catalog}\n\nClaims:\n${numberedClaims}`,
+      },
+    ],
+    { temperature: 0.2 },
+  );
+
+  try {
+    const parsed = parseLLMJson(resp.content);
+    const assignments = parsed.assignments as {
+      index: number;
+      entity?: string;
+      entity_id?: string;
+    }[];
+    const result: string[] = [];
+    for (let i = 0; i < statements.length; i++) {
+      const match = assignments?.find((a) => a.index === i + 1);
+      const id = String(match?.entity_id ?? "").trim();
+      const name = String(match?.entity ?? "").trim();
+      result.push(id || name || "");
+    }
+    return result;
+  } catch {
+    return statements.map(() => "");
+  }
+}
+
+function ensurePageForTitle(store: KnowledgeStore, pageTitle: string) {
+  let page = store.getPageByTitle(pageTitle);
+  if (!page) {
+    const path = titleToPath(pageTitle);
+    try {
+      page = store.addPage(pageTitle, path);
+    } catch {
+      const existing = store.listPages().find((p) => p.path === path);
+      page = existing ?? store.addPage(pageTitle, path + "-" + Date.now() + ".md");
+    }
+  }
+  return page;
 }
 
 export async function generatePageSummaries(

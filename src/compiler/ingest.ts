@@ -12,6 +12,7 @@ import type {
   KnowledgeDiff,
   QuickyConfig,
   ClaimType,
+  ResolveKnowledgeContext,
 } from "../types.js";
 import { normalizeClaimType } from "../types.js";
 import { scoreConfidence } from "./confidence.js";
@@ -34,7 +35,16 @@ export type IngestSourceOptions = {
 };
 
 /** Diff plus optional pipeline stats returned after `resolveKnowledge`. */
-export type IngestResult = KnowledgeDiff & { relationsCompiled?: number };
+export type IngestResult = KnowledgeDiff & {
+  relationsCompiled?: number;
+  /** Entity IDs whose primary pages received new or updated claims in this ingest (best-effort). */
+  affectedEntityIds?: string[];
+};
+
+export type IngestRawMarkdownOptions = IngestSourceOptions & {
+  /** When false, skip gray-matter parsing (body = full string, empty frontmatter). Default: true if path ends with .md/.mdx or content starts with `---`. */
+  parseMarkdown?: boolean;
+};
 
 /**
  * First matching kindRules entry wins. Rules use path substring match, or
@@ -174,31 +184,81 @@ function syncPrimaryPageEntity(
   store.syncEntityWithPrimaryPage(page.id);
 }
 
-export async function ingestSource(
+function collectAffectedEntityIds(
+  store: KnowledgeStore,
+  diff: KnowledgeDiff,
+): string[] {
+  const ids = new Set<string>();
+  const addForClaim = (claimId: string) => {
+    const pageId = store.getClaimPageId(claimId);
+    if (!pageId) return;
+    const page = store.getPage(pageId);
+    if (page?.entityId) ids.add(page.entityId);
+  };
+  for (const nc of diff.newClaims) {
+    if (nc.claimId) addForClaim(nc.claimId);
+  }
+  for (const r of diff.reinforced) {
+    if (r.claimId) addForClaim(r.claimId);
+  }
+  for (const c of diff.challenged) {
+    if (c.claimId) addForClaim(c.claimId);
+  }
+  return [...ids];
+}
+
+function shouldParseMarkdown(
+  virtualPath: string,
+  raw: string,
+  explicit?: boolean,
+): boolean {
+  if (explicit === false) return false;
+  if (explicit === true) return true;
+  const ext = extname(virtualPath).toLowerCase();
+  if (ext === ".md" || ext === ".mdx") return true;
+  return raw.trimStart().startsWith("---");
+}
+
+function defaultTitleFromPath(virtualPath: string): string {
+  const base = basename(virtualPath, extname(virtualPath));
+  if (base && base !== virtualPath) return base;
+  const parts = virtualPath.split(/[:/\\]/).filter(Boolean);
+  return parts[parts.length - 1] || "Source";
+}
+
+/**
+ * Ingest markdown (or plain text) from memory using a stable virtual `sources.path`
+ * (e.g. `pulse:conversation:<sessionId>:<YYYY-MM-DD>`). Same pipeline as {@link ingestSource}.
+ */
+export async function ingestRawMarkdown(
   store: KnowledgeStore,
   llm: LLMAdapter,
-  filePath: string,
-  opts?: IngestSourceOptions,
+  virtualPath: string,
+  rawMarkdown: string,
+  opts?: IngestRawMarkdownOptions,
 ): Promise<IngestResult> {
   const progress = opts?.onProgress ?? (() => {});
-  const raw = await readFile(filePath, "utf-8");
-  const contentHash = createHash("sha256").update(raw).digest("hex");
+  const contentHash = createHash("sha256").update(rawMarkdown).digest("hex");
 
-  const ext = extname(filePath).toLowerCase();
-  let content = raw;
+  const parseMd = shouldParseMarkdown(
+    virtualPath,
+    rawMarkdown,
+    opts?.parseMarkdown,
+  );
+  let content = rawMarkdown;
   let frontmatter: Record<string, unknown> = {};
-  if (ext === ".md" || ext === ".mdx") {
-    const parsed = matter(raw);
+  if (parseMd) {
+    const parsed = matter(rawMarkdown);
     content = parsed.content;
     frontmatter = parsed.data;
   }
 
   const title =
-    (frontmatter.title as string) || basename(filePath, extname(filePath));
+    (frontmatter.title as string) || defaultTitleFromPath(virtualPath);
 
   const resolvedKind =
     opts?.kind ??
-    inferPageKind(filePath, frontmatter, opts?.config?.kindRules);
+    inferPageKind(virtualPath, frontmatter, opts?.config?.kindRules);
   const pageMetadata = cloneMetadata(frontmatter, opts?.metadata);
   const primaryPageTitle = resolvePrimaryPageTitle(
     resolvedKind,
@@ -207,7 +267,7 @@ export async function ingestSource(
     opts?.config,
   );
 
-  const existing = store.getSourceByPath(filePath);
+  const existing = store.getSourceByPath(virtualPath);
   if (existing && existing.contentHash === contentHash) {
     syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
     return {
@@ -218,10 +278,11 @@ export async function ingestSource(
       newConcepts: [],
       newClaims: [],
       gapsIdentified: [],
+      affectedEntityIds: [],
     };
   }
 
-  const type = opts?.type || inferSourceType(filePath, frontmatter);
+  const type = opts?.type || inferSourceType(virtualPath, frontmatter);
   const qualityTier =
     opts?.qualityTier ?? inferQuality(frontmatter, opts?.config);
 
@@ -231,7 +292,7 @@ export async function ingestSource(
     source = { ...existing, contentHash };
   } else {
     source = store.addSource({
-      path: filePath,
+      path: virtualPath,
       title,
       type,
       qualityTier,
@@ -265,6 +326,20 @@ export async function ingestSource(
     `${diff.newClaims.length} new, ${diff.reinforced.length} reinforced, ${diff.challenged.length} challenged`,
   );
 
+  syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
+
+  const primaryPageAfterSync = store.getPageByTitle(primaryPageTitle);
+  let sourcePrimaryCanonicalName: string | undefined;
+  if (primaryPageAfterSync?.entityId) {
+    const ent = store.getEntity(primaryPageAfterSync.entityId);
+    sourcePrimaryCanonicalName = ent?.canonicalName;
+  }
+  const resolveContext: ResolveKnowledgeContext = {
+    sourcePrimaryEntityId: primaryPageAfterSync?.entityId ?? undefined,
+    sourcePrimaryCanonicalName,
+    pageKind: resolvedKind,
+  };
+
   progress("resolving", `Resolving knowledge graph...`);
   const { relationsCompiled } = await resolveKnowledge(
     store,
@@ -272,10 +347,9 @@ export async function ingestSource(
     diff,
     source,
     opts?.config,
+    resolveContext,
   );
   progress("done", `Ingestion complete`);
-
-  syncPrimaryPageEntity(store, primaryPageTitle, resolvedKind, pageMetadata);
 
   if (
     entityMetadata &&
@@ -288,7 +362,25 @@ export async function ingestSource(
     }
   }
 
-  return { ...diff, relationsCompiled };
+  // newClaims.claimId is populated during resolveKnowledge
+  const affectedEntityIds = collectAffectedEntityIds(store, diff);
+
+  return { ...diff, relationsCompiled, affectedEntityIds };
+}
+
+export async function ingestSource(
+  store: KnowledgeStore,
+  llm: LLMAdapter,
+  filePath: string,
+  opts?: IngestSourceOptions,
+): Promise<IngestResult> {
+  const raw = await readFile(filePath, "utf-8");
+  const ext = extname(filePath).toLowerCase();
+  const parseMarkdown = ext === ".md" || ext === ".mdx" || raw.trimStart().startsWith("---");
+  return ingestRawMarkdown(store, llm, filePath, raw, {
+    ...opts,
+    parseMarkdown,
+  });
 }
 
 interface ExtractedClaim {

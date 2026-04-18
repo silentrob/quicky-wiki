@@ -199,6 +199,13 @@ export interface KnowledgeDiff {
   }>;
 }
 
+/** Optional ingest hints so claim assignment biases “aboutness” toward the source subject. */
+export interface ResolveKnowledgeContext {
+  sourcePrimaryEntityId?: string;
+  sourcePrimaryCanonicalName?: string;
+  pageKind?: string;
+}
+
 // --- Health Report ---
 export interface HealthReport {
   totalClaims: number;

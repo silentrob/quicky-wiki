@@ -361,6 +361,59 @@ export function startDashboard(
               : store.search(q, 20);
           cache.set(`search:${q}`, data, 60000);
           json(res, data);
+        } else if (url.pathname === "/api/graph-query") {
+          const entity = (url.searchParams.get("entity") ?? "").trim();
+          if (!entity) {
+            json(res, { error: "entity query parameter is required" }, 400);
+            return;
+          }
+          const directionRaw = url.searchParams.get("direction") ?? "both";
+          const direction =
+            directionRaw === "outbound" ||
+            directionRaw === "inbound" ||
+            directionRaw === "both"
+              ? directionRaw
+              : "both";
+          const typesRaw = url.searchParams.get("relation_types");
+          const relationTypes = typesRaw
+            ? typesRaw
+                .split(",")
+                .map((t) => t.trim().toLowerCase())
+                .filter(Boolean)
+            : undefined;
+          const resolvedId = store.resolveEntityIdFromName(entity);
+          if (!resolvedId) {
+            json(res, {
+              resolved: null,
+              edges: [],
+              message: `No entity matched "${entity}". Try a canonical name, an alias, or a partial name.`,
+            });
+            return;
+          }
+          const ent = store.getEntity(resolvedId);
+          if (!ent) {
+            json(res, {
+              resolved: null,
+              edges: [],
+              message: "Entity not found.",
+            });
+            return;
+          }
+          const edges = store.queryGraph(entity, {
+            relationTypes:
+              relationTypes && relationTypes.length > 0
+                ? relationTypes
+                : undefined,
+            direction,
+          });
+          json(res, {
+            resolved: {
+              id: ent.id,
+              canonicalName: ent.canonicalName,
+              type: ent.type,
+            },
+            edges,
+          });
         } else if (url.pathname === "/api/bookmark" && req.method === "POST") {
           const body = await readBody(req);
           const { url: bookmarkUrl } = JSON.parse(body);
@@ -712,6 +765,7 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
     <div class="sidebar-section">
       <div class="sidebar-label">Interact</div>
       <div class="nav-item" data-view="ask"><span class="nav-icon">💬</span>Ask Wiki</div>
+      <div class="nav-item" data-view="graph-lookup"><span class="nav-icon">🔗</span>Graph lookup</div>
     </div>
     <div class="sidebar-stats" id="sidebar-stats"></div>
   </div>
@@ -799,6 +853,35 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
         <div class="chat-input-area">
           <textarea class="chat-input" id="chat-input" placeholder="Ask a question... (Enter to send)" rows="1"></textarea>
           <button class="chat-send" id="chat-send">Ask ⏎</button>
+        </div>
+      </div>
+    </div>
+    <div id="view-graph-lookup" class="view">
+      <div class="panel">
+        <div class="panel-header">Graph lookup<span style="margin-left:auto;font-weight:400;color:var(--text-dim);font-size:12px">Typed relations only · no LLM</span></div>
+        <div class="panel-body" style="padding:16px 18px">
+          <p style="font-size:13px;color:var(--text-dim);margin:0 0 14px;max-width:640px">Traverse <strong>relations</strong> stored in the graph (same as MCP <code style="font-size:11px">query_graph</code>). This is not semantic search—use <strong>Ask Wiki</strong> for natural-language answers over claims.</p>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:14px">
+            <div style="flex:1;min-width:200px">
+              <label for="graph-lookup-entity-input" style="display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px">Entity</label>
+              <input type="text" id="graph-lookup-entity-input" list="graph-lookup-entities" placeholder="Canonical name, alias, or partial…" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:var(--radius-sm);font-size:14px;outline:none;font-family:inherit;box-shadow:var(--shadow-xs)">
+              <datalist id="graph-lookup-entities"></datalist>
+            </div>
+            <div>
+              <label for="graph-lookup-direction" style="display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px">Direction</label>
+              <select id="graph-lookup-direction" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:var(--radius-sm);font-size:13px;outline:none;font-family:inherit;cursor:pointer;box-shadow:var(--shadow-xs)">
+                <option value="both">Both</option>
+                <option value="outbound">Outbound</option>
+                <option value="inbound">Inbound</option>
+              </select>
+            </div>
+            <div style="flex:1;min-width:180px">
+              <label for="graph-lookup-types" style="display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px">Relation types (optional)</label>
+              <input type="text" id="graph-lookup-types" placeholder="works_at, spouse_of …" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:var(--radius-sm);font-size:13px;outline:none;font-family:inherit;box-shadow:var(--shadow-xs)">
+            </div>
+            <button type="button" id="graph-lookup-run" style="background:var(--accent);color:#fff;border:none;padding:10px 18px;border-radius:var(--radius-sm);cursor:pointer;font-size:14px;font-family:inherit;font-weight:600">Lookup</button>
+          </div>
+          <div id="graph-lookup-results" style="min-height:120px"></div>
         </div>
       </div>
     </div>
@@ -1627,9 +1710,55 @@ chatSend.addEventListener('click',()=>askQuestion(chatInput.value));
 chatInput.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askQuestion(chatInput.value);}});
 chatInput.addEventListener('input',()=>{chatInput.style.height='auto';chatInput.style.height=Math.min(chatInput.scrollHeight,120)+'px';});
 
+function fillGraphLookupDatalist(){
+  const dl=document.getElementById('graph-lookup-entities');
+  if(!dl||!DATA.entities)return;
+  dl.innerHTML=DATA.entities.map(e=>'<option value="'+esc(e.canonicalName)+'">').join('');
+}
+async function runGraphLookup(){
+  const input=document.getElementById('graph-lookup-entity-input');
+  const out=document.getElementById('graph-lookup-results');
+  const entity=(input&&input.value||'').trim();
+  if(!entity){if(out)out.innerHTML='<p style="color:var(--text-dim);font-size:13px">Enter an entity name.</p>';return;}
+  const directionEl=document.getElementById('graph-lookup-direction');
+  const typesEl=document.getElementById('graph-lookup-types');
+  const direction=directionEl?directionEl.value:'both';
+  const types=typesEl?(typesEl.value||'').trim():'';
+  const params=new URLSearchParams({entity,direction});
+  if(types)params.set('relation_types',types);
+  if(out)out.innerHTML='<p style="color:var(--text-dim);font-size:13px">Loading…</p>';
+  try{
+    const r=await fetch('/api/graph-query?'+params.toString());
+    const data=await r.json();
+    if(!r.ok){if(out)out.innerHTML='<p style="color:var(--red);font-size:13px">'+esc(data.error||r.statusText)+'</p>';return;}
+    if(!data.resolved){
+      if(out)out.innerHTML='<p style="color:var(--text-dim);font-size:13px">'+esc(data.message||'No match.')+'</p>';
+      return;
+    }
+    const head='<p style="font-size:13px;margin:0 0 10px">Resolved: <strong class="entity-chip" data-entity-id="'+esc(data.resolved.id)+'" style="cursor:pointer">'+esc(data.resolved.canonicalName)+'</strong> <code style="font-size:11px">'+esc(data.resolved.type)+'</code></p>';
+    if(!data.edges||!data.edges.length){
+      if(out)out.innerHTML=head+'<p style="color:var(--text-dim);font-size:13px;margin:0">No typed relations for this entity with the current filters.</p>';
+      return;
+    }
+    let table='<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr><th style="text-align:left;padding:8px;border-bottom:1px solid var(--border)">From</th><th style="text-align:left;padding:8px;border-bottom:1px solid var(--border)">Relation</th><th style="text-align:left;padding:8px;border-bottom:1px solid var(--border)">To</th><th style="text-align:right;padding:8px;border-bottom:1px solid var(--border)">Conf</th></tr></thead><tbody>';
+    for(const e of data.edges){
+      table+='<tr><td style="padding:8px;border-bottom:1px solid var(--border)"><span class="entity-chip" data-entity-id="'+esc(e.from.id)+'" style="cursor:pointer">'+esc(e.from.name)+'</span> <code style="font-size:10px;color:var(--text-dim)">'+esc(e.from.type)+'</code></td>';
+      table+='<td style="padding:8px;border-bottom:1px solid var(--border)"><code>'+esc(e.relation_type)+'</code></td>';
+      table+='<td style="padding:8px;border-bottom:1px solid var(--border)"><span class="entity-chip" data-entity-id="'+esc(e.to.id)+'" style="cursor:pointer">'+esc(e.to.name)+'</span> <code style="font-size:10px;color:var(--text-dim)">'+esc(e.to.type)+'</code></td>';
+      table+='<td style="padding:8px;border-bottom:1px solid var(--border);text-align:right">'+(typeof e.confidence==='number'?(e.confidence*100).toFixed(0)+'%':'—')+'</td></tr>';
+    }
+    table+='</tbody></table>';
+    if(out)out.innerHTML=head+table;
+  }catch(err){
+    if(out)out.innerHTML='<p style="color:var(--red);font-size:13px">'+esc(err.message||String(err))+'</p>';
+  }
+}
+document.getElementById('graph-lookup-run').addEventListener('click',runGraphLookup);
+document.getElementById('graph-lookup-entity-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runGraphLookup();}});
+
 setInterval(async()=>{try{const s=await fetch('/api/stats').then(r=>r.json());if(JSON.stringify(s)!==JSON.stringify(DATA.stats)){await fetchAll();renderAll();}}catch{}},5000);
 
-function renderAll(){renderStatsRow();renderSidebarStats();renderOverview();renderClaims();renderPages();renderEntities();renderReviewQueue();renderTimeline();renderHealth();renderChatSuggestions();if(graphRendered){graphRendered=false;renderGraph();}}
+function renderAll(){renderStatsRow();renderSidebarStats();renderOverview();renderClaims();renderPages();renderEntities();renderReviewQueue();renderTimeline();renderHealth();renderChatSuggestions();fillGraphLookupDatalist();if(graphRendered){graphRendered=false;renderGraph();}}
 fetchAll().then(()=>renderAll());
 <\/script>
 </body>
