@@ -1,12 +1,14 @@
 import type { KnowledgeStore } from "../graph/store.js";
 import type { HealthReport } from "../types.js";
 import { findCascadeRisks } from "../graph/cascade.js";
+import { collectOpenIssues } from "./open-issues.js";
 
 export function generateHealthReport(
   store: KnowledgeStore,
   staleThresholdDays: number,
 ): HealthReport {
   const allClaims = store.listClaims();
+  const openIssues = collectOpenIssues(store);
   const now = Date.now();
 
   const highConfidence = allClaims.filter((c) => c.confidence > 0.8).length;
@@ -27,13 +29,18 @@ export function generateHealthReport(
       ),
     }));
 
-  const contestedClaims = allClaims
-    .filter((c) => c.contradictedBy.length > 0)
-    .map((c) => ({
-      claimId: c.id,
-      statement: c.statement,
-      contradictions: c.contradictedBy.length,
-    }));
+  const contestedClaims = openIssues
+    .filter((o) => o.kind === "unresolved_contradiction")
+    .map((o) => {
+      const cid = o.claimIds?.[0];
+      const claim = cid ? store.getClaim(cid) : null;
+      return {
+        claimId: cid ?? "",
+        statement: claim?.statement ?? "",
+        contradictions: o.contradictingClaimIds?.length ?? 0,
+      };
+    })
+    .filter((r) => r.claimId);
 
   const cascadeRisks = findCascadeRisks(store)
     .filter((r) => r.dependentCount >= 2)
@@ -70,6 +77,13 @@ export function generateHealthReport(
     suggestedActions.push(
       `Resolve ${contestedClaims.length} contested claims with contradicting evidence`,
     );
+  const unsupportedHyp = openIssues.filter(
+    (o) => o.kind === "unsupported_hypothesis",
+  ).length;
+  if (unsupportedHyp > 0)
+    suggestedActions.push(
+      `${unsupportedHyp} hypothesis claim(s) lack supporting claim links — add evidence or dependencies`,
+    );
   if (lowConfidence > allClaims.length * 0.3)
     suggestedActions.push(
       `${lowConfidence} claims have low confidence — consider finding better sources`,
@@ -87,10 +101,11 @@ export function generateHealthReport(
     highConfidence,
     mediumConfidence,
     lowConfidence,
+    openIssues,
     staleClaims,
     contestedClaims,
     cascadeRisks,
-    gaps: [], // populated by discovery module
+    gaps: [],
     suggestedActions,
     ontology,
   };

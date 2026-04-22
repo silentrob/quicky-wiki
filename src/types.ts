@@ -123,6 +123,8 @@ export const COMPILED_VIEW_TYPES = [
   "agent_context",
   "status_card",
   "briefing",
+  "open_questions",
+  "support_gaps",
 ] as const;
 export type CompiledViewType = (typeof COMPILED_VIEW_TYPES)[number];
 
@@ -206,12 +208,31 @@ export interface ResolveKnowledgeContext {
   pageKind?: string;
 }
 
+/** Deterministic knowledge hygiene / gap signals (no LLM). */
+export type OpenIssueKind =
+  | "pending_alias"
+  | "unresolved_contradiction"
+  | "unsupported_hypothesis";
+
+export interface OpenIssue {
+  kind: OpenIssueKind;
+  priority: "high" | "medium" | "low";
+  summary: string;
+  claimIds?: string[];
+  entityIds?: string[];
+  pendingAliasId?: string;
+  /** For `unresolved_contradiction`: opposing claim ids. */
+  contradictingClaimIds?: string[];
+}
+
 // --- Health Report ---
 export interface HealthReport {
   totalClaims: number;
   highConfidence: number; // > 0.8
   mediumConfidence: number; // 0.4 - 0.8
   lowConfidence: number; // < 0.4
+  /** Deterministic open issues (aliases, contradictions, unsupported hypotheses). */
+  openIssues: OpenIssue[];
   staleClaims: Array<{
     claimId: string;
     statement: string;
@@ -229,6 +250,7 @@ export interface HealthReport {
     dependents: number;
     confidence: number;
   }>;
+  /** Unused; reserved for structured ingest gap hints. LLM discovery stays separate. */
   gaps: Array<{ concept: string; references: number }>;
   suggestedActions: string[];
   /** Entity / relation coverage (Phase 4 health). */

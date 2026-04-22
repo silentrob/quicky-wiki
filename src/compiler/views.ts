@@ -1,5 +1,9 @@
 import type { KnowledgeStore } from "../graph/store.js";
 import type { CompiledViewType, LLMAdapter } from "../types.js";
+import {
+  collectOpenIssues,
+  formatOpenIssuesForPrompt,
+} from "../metabolism/open-issues.js";
 
 /**
  * Return cached compiled view or run an LLM pass to fill `compiled_views`.
@@ -28,12 +32,25 @@ export async function ensureCompiledView(
   const claimsText = (detail?.claims ?? [])
     .map((c) => `- (${(c.confidence * 100).toFixed(0)}%) ${c.statement}`)
     .join("\n");
-  const relText = (detail?.relations ?? [])
-    .map(
-      (r) =>
-        `- ${r.relationType} ${r.direction === "outbound" ? "→" : "←"} ${r.otherCanonicalName}`,
-    )
+  const claimsDetailText = (detail?.claims ?? [])
+    .map((c) => {
+      const deps = c.dependsOn.length;
+      const contra = c.contradictedBy.length;
+      return `- (${(c.confidence * 100).toFixed(0)}%) [${c.claimType}] depends_on:${deps} contested_by:${contra} ${c.statement}`;
+    })
     .join("\n");
+  const relText = (detail?.relations ?? [])
+    .map((r) => {
+      const pct = (r.confidence * 100).toFixed(0);
+      const arrow = r.direction === "outbound" ? "→" : "←";
+      const st = r.status && r.status !== "active" ? ` [${r.status}]` : "";
+      return `- ${r.relationType} (${pct}%)${st} ${arrow} ${r.otherCanonicalName}`;
+    })
+    .join("\n");
+
+  const issueHints = formatOpenIssuesForPrompt(
+    collectOpenIssues(store, { entityId, maxTotal: 20 }),
+  );
 
   const prompts: Record<
     CompiledViewType,
@@ -58,6 +75,16 @@ export async function ensureCompiledView(
       system:
         "Week-scoped briefing: what matters now for this entity, 5–8 bullet points. Do not invent dates.",
       user: `Entity: ${entity.canonicalName} (${entity.type})\nClaims:\n${claimsText || "(none)"}\nRelations:\n${relText || "(none)"}`,
+    },
+    open_questions: {
+      system:
+        "Output plain-text numbered questions only (no answers). Ground every question in the data below; do not invent facts. Max 12 questions.",
+      user: `Entity: ${entity.canonicalName} (${entity.type})\nMetadata: ${JSON.stringify(entity.metadata)}\n\nClaims:\n${claimsText || "(none)"}\n\nRelations:\n${relText || "(none)"}\n\nDeterministic open-issue hints for this entity:\n${issueHints}`,
+    },
+    support_gaps: {
+      system:
+        "Output plain-text bullet lines describing epistemic / support gaps for this entity: missing depends_on, contested claims, hypotheses without support, low-confidence statements. Ground in the data; do not invent. Max 15 bullets.",
+      user: `Entity: ${entity.canonicalName} (${entity.type})\n\nClaims (with dependency and contradiction counts):\n${claimsDetailText || "(none)"}\n\nRelations:\n${relText || "(none)"}\n\nDeterministic open-issue hints for this entity:\n${issueHints}`,
     },
   };
 

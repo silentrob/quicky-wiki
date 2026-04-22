@@ -69,4 +69,6 @@ export type {
   CompiledViewType,
   CompiledView,
   EntityStateChange,
+  OpenIssue,
+  OpenIssueKind,
 } from "./types.js";

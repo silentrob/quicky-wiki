@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { KnowledgeStore } from "../graph/store.js";
 import type { QuickyConfig, LLMAdapter, CompiledViewType } from "../types.js";
 import { COMPILED_VIEW_TYPES } from "../types.js";
+import type { DiscoveryMode } from "../discovery/discover.js";
 import { generateHealthReport } from "../metabolism/health.js";
 import { renderGraphData } from "../render/graph-viz.js";
 import { queryKnowledge } from "../graph/query.js";
@@ -128,6 +129,62 @@ export function startDashboard(
               lastReinforced: c.lastReinforced,
             })),
             relations: detail.relations,
+          });
+        } else if (url.pathname === "/api/claim" && req.method === "GET") {
+          const id = url.searchParams.get("id");
+          if (!id) {
+            json(res, { error: "Missing id" }, 400);
+            return;
+          }
+          const claim =
+            store.getClaim(id) || store.getClaim(id.toLowerCase());
+          if (!claim) {
+            json(res, { error: "Not found" }, 404);
+            return;
+          }
+          const page = store.getPage(claim.pageId);
+          const sources = claim.sources.map((sid) => {
+            const s = store.getSource(sid);
+            return s
+              ? {
+                  id: s.id,
+                  title: s.title,
+                  type: s.type,
+                  path: s.path,
+                  qualityTier: s.qualityTier,
+                }
+              : {
+                  id: sid,
+                  title: "(source missing)",
+                  type: "other",
+                  path: "",
+                  qualityTier: "unknown",
+                };
+          });
+          json(res, {
+            id: claim.id,
+            statement: claim.statement,
+            confidence: claim.confidence,
+            claimType: claim.claimType,
+            firstStated: claim.firstStated,
+            lastReinforced: claim.lastReinforced,
+            decayRate: claim.decayRate,
+            tags: claim.tags,
+            contradictedBy: claim.contradictedBy,
+            dependsOn: claim.dependsOn,
+            derivedClaims: claim.derivedClaims,
+            sources,
+            timeline: claim.timeline.map((ev) => ({
+              id: ev.id,
+              date: ev.date,
+              type: ev.type,
+              confidenceBefore: ev.confidenceBefore,
+              confidenceAfter: ev.confidenceAfter,
+              note: ev.note,
+              triggerSourceId: ev.triggerSourceId,
+            })),
+            pageId: claim.pageId,
+            pageTitle: page?.title ?? null,
           });
         } else if (url.pathname === "/api/review-queue") {
           if (req.method === "GET") {
@@ -340,6 +397,45 @@ export function startDashboard(
                   e?.message || "LLM query failed. Check API key and config.",
               },
               500,
+            );
+          }
+        } else if (url.pathname === "/api/discover" && req.method === "POST") {
+          const rawBody = await readBody(req);
+          let mode: string = "contradictions";
+          try {
+            const parsed = JSON.parse(rawBody || "{}");
+            if (parsed.mode != null) mode = String(parsed.mode);
+          } catch {
+            json(res, { error: "Invalid JSON body" }, 400);
+            return;
+          }
+          const allowed: DiscoveryMode[] = [
+            "gaps",
+            "horizon",
+            "bridges",
+            "contradictions",
+          ];
+          if (!allowed.includes(mode as DiscoveryMode)) {
+            json(
+              res,
+              { error: `mode must be one of: ${allowed.join(", ")}` },
+              400,
+            );
+            return;
+          }
+          try {
+            const { discover } = await import("../discovery/discover.js");
+            const discoveries = await discover(
+              store,
+              llm,
+              mode as DiscoveryMode,
+            );
+            json(res, { discoveries });
+          } catch (e: any) {
+            json(
+              res,
+              { error: e?.message || "Discover failed. Check LLM config." },
+              502,
             );
           }
         } else if (url.pathname === "/api/search") {
@@ -651,6 +747,8 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
 .slideOver-close:hover{background:var(--border);color:var(--text)}
 .slideOver-body{flex:1;overflow-y:auto;padding:24px}
 .slideOver-section{margin-bottom:24px}
+.page-claim-row{transition:var(--transition);border-radius:var(--radius-xs);margin:0 -6px;padding-left:6px;padding-right:6px}
+.page-claim-row:hover{background:var(--accent-light)}
 .slideOver-section h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--text-xdim);margin-bottom:10px;font-weight:600}
 .md-content{font-size:14.5px;line-height:1.75;color:var(--text-dim);max-width:52ch}
 .md-content h1,.md-content h2,.md-content h3{color:var(--text);margin:16px 0 8px;letter-spacing:-.2px}
@@ -744,7 +842,7 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
     <div class="logo"><span class="logo-icon">⚡</span>${esc(wikiName)}</div>
     <div class="search-wrapper">
       <span class="search-icon">🔍</span>
-      <input type="text" class="search-box" id="global-search" placeholder="Search... try entity:person or claim:fact" autocomplete="off">
+      <input type="text" class="search-box" id="global-search" placeholder="Search... claim id, entity:person, claim:fact" autocomplete="off">
       <span class="search-kbd">⌘K</span>
       <div class="search-results" id="search-results"></div>
     </div>
@@ -819,7 +917,16 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
       <div class="panel"><table><thead><tr><th>Title</th><th>Kind</th><th>Entity</th><th>Metadata</th><th>Claims</th><th>Links</th><th>Updated</th></tr></thead><tbody id="pages-table"></tbody></table></div>
     </div>
     <div id="view-entities" class="view">
-      <input type="text" id="entity-search" placeholder="Filter entities..." style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:var(--radius-sm);font-size:14px;outline:none;margin-bottom:18px;font-family:inherit;box-shadow:var(--shadow-xs)">
+      <div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="entity-search" placeholder="Filter entities..." style="flex:1;min-width:200px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:var(--radius-sm);font-size:14px;outline:none;font-family:inherit;box-shadow:var(--shadow-xs)">
+        <label for="entity-sort" style="font-size:12px;font-weight:600;color:var(--text-dim);white-space:nowrap">Sort by</label>
+        <select id="entity-sort" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:var(--radius-sm);font-size:13px;outline:none;font-family:inherit;cursor:pointer;box-shadow:var(--shadow-xs);min-width:200px">
+          <option value="rels-desc">Relations (hubs first)</option>
+          <option value="rels-asc">Relations (fewest first)</option>
+          <option value="name-asc">Name (A–Z)</option>
+          <option value="name-desc">Name (Z–A)</option>
+        </select>
+      </div>
       <div class="panel"><table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Aliases</th><th>Claims</th><th>Rels</th><th>Page</th></tr></thead><tbody id="entities-table"></tbody></table></div>
     </div>
     <div id="view-timeline" class="view">
@@ -839,6 +946,21 @@ tr{transition:var(--transition);cursor:pointer}tr:hover td{background:var(--acce
         <div class="panel"><div class="panel-header">⏰ Stale Claims</div><div class="panel-body" id="stale-claims"></div></div>
       </div>
       <div class="panel" style="margin-top:16px"><div class="panel-header">⚔️ Contested</div><div class="panel-body" id="contested-claims"></div></div>
+      <div class="panel" style="margin-top:16px"><div class="panel-header">📋 Open issues (deterministic)</div><div class="panel-body" id="health-open-issues"></div></div>
+      <div class="panel" style="margin-top:16px"><div class="panel-header">🔭 LLM discovery</div><div class="panel-body" style="font-size:13px">
+        <p style="color:var(--text-dim);margin:0 0 12px;line-height:1.45">Narrative scan (same as CLI <code style="font-size:11px">qw discover</code>). Results are not saved to the graph.</p>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px">
+          <select id="discover-mode" style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:13px;font-family:inherit;cursor:pointer">
+            <option value="contradictions" selected>Contradictions</option>
+            <option value="gaps">Gaps</option>
+            <option value="horizon">Horizon</option>
+            <option value="bridges">Bridges</option>
+          </select>
+          <button type="button" id="discover-run" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit;font-weight:600">Run discovery</button>
+          <span id="discover-status" style="font-size:12px;color:var(--text-dim)"></span>
+        </div>
+        <div id="discover-results"></div>
+      </div></div>
     </div>
     <div id="view-ask" class="view">
       <div class="chat-container">
@@ -951,13 +1073,13 @@ searchInput.addEventListener('input',()=>{
       if(i.kind==='entity')return'<div class="search-result-item" data-action="entity" data-id="'+i.id+'"><span class="sr-type sr-entity">'+esc(i.type)+'</span><span>'+esc(i.canonicalName)+'</span><span style="font-size:11px;color:var(--text-xdim);margin-left:auto">'+i.claimCount+' claims · '+i.relationCount+' rels</span></div>';
       if(i.kind==='page')return'<div class="search-result-item" data-action="page" data-id="'+i.id+'"><span class="sr-type sr-page">Page</span><span>'+esc(i.title)+'</span></div>';
       if(i.kind==='relation')return'<div class="search-result-item" data-action="noop" style="cursor:default"><span class="sr-type" style="background:var(--accent-dim);color:var(--accent)">Rel</span><span style="font-size:12px">'+esc(i.from.name)+' <code style="font-size:10px">'+esc(i.relation_type)+'</code> '+esc(i.to.name)+'</span></div>';
-      return'<div class="search-result-item" data-action="claim" data-id="'+i.pageId+'"><span class="sr-type sr-claim">'+esc(i.claimType||'claim')+'</span><span>'+esc(i.statement.slice(0,80))+'</span>'+confBadge(i.confidence)+'</div>';
+      return'<div class="search-result-item" data-action="claim" data-claim-id="'+esc(i.id)+'" data-id="'+i.pageId+'"><span class="sr-type sr-claim">'+esc(i.claimType||'claim')+'</span><span>'+esc(i.statement.slice(0,80))+'</span>'+confBadge(i.confidence)+'</div>';
     }).join('');}
     searchResultsEl.classList.add('active');
   },200);
 });
 searchInput.addEventListener('focus',()=>{if(searchInput.value.trim().length>=2)searchResultsEl.classList.add('active');});
-searchResultsEl.addEventListener('click',e=>{const item=e.target.closest('.search-result-item');if(!item)return;const act=item.dataset.action;if(act==='noop')return;if(act==='entity'){openEntity(item.dataset.id);closeSearch();return;}openPage(item.dataset.id);closeSearch();});
+searchResultsEl.addEventListener('click',e=>{const item=e.target.closest('.search-result-item');if(!item)return;const act=item.dataset.action;if(act==='noop')return;if(act==='entity'){openEntity(item.dataset.id);closeSearch();return;}if(act==='claim'&&item.dataset.claimId){openClaim(item.dataset.claimId);closeSearch();return;}openPage(item.dataset.id);closeSearch();});
 document.addEventListener('click',e=>{if(!e.target.closest('.search-wrapper'))closeSearch();});
 function closeSearch(){searchResultsEl.classList.remove('active');}
 
@@ -1013,12 +1135,12 @@ async function openPage(pageId){
   if(hasSummary)html+='<div class="slideOver-section"><h3>Summary</h3><p style="font-size:13px;color:var(--text-dim)">'+esc(page.summary)+'</p></div>';
   if(hasClaims){
     html+='<div class="slideOver-section"><h3>Claims ('+page.claims.length+')</h3>';
-    html+=page.claims.map(c=>'<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px">'+confBadge(c.confidence)+claimTypeBadge(c.claimType||'fact')+'<div style="flex:1"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px">'+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div><button class="del-page-claim" data-claim-id="'+c.id+'" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:13px;padding:2px 6px;border-radius:4px;flex-shrink:0" title="Delete claim">✕</button></div>').join('');
+    html+=page.claims.map(c=>'<div class="page-claim-row" data-claim-id="'+esc(c.id)+'" title="View claim details" style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px;cursor:pointer"><div style="flex:1;min-width:0;display:flex;align-items:flex-start;gap:10px;pointer-events:none">'+confBadge(c.confidence)+claimTypeBadge(c.claimType||'fact')+'<div style="flex:1;min-width:0"><div style="font-size:13px">'+esc(c.statement)+'</div><div style="font-size:11px;color:var(--text-dim);margin-top:2px">'+c.sources+' source'+(c.sources!==1?'s':'')+' · '+relTime(c.lastReinforced)+'</div></div></div><button type="button" class="del-page-claim" data-claim-id="'+c.id+'" style="background:none;border:none;cursor:pointer;color:var(--text-xdim);font-size:13px;padding:2px 6px;border-radius:4px;flex-shrink:0;pointer-events:auto" title="Delete claim">✕</button></div>').join('');
     html+='</div>';
   }
   if(page.entityRelations&&page.entityRelations.length){
-    html+='<div class="slideOver-section"><h3>Relations ('+page.entityRelations.length+')</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
-    html+=page.entityRelations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong class="entity-chip" data-entity-id="'+esc(r.otherEntityId)+'" style="cursor:pointer">'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
+    html+='<div class="slideOver-section"><h3>Relations ('+page.entityRelations.length+')</h3><ul style="margin:0;padding-left:0;list-style:none;font-size:13px">';
+    html+=page.entityRelations.map(formatRelationListItem).join('');
     html+='</ul></div>';
   }
   if(hasLinks){
@@ -1029,7 +1151,10 @@ async function openPage(pageId){
   if(page.entityInfo){
     html+='<div class="slideOver-section"><h3>Entity</h3><div><span class="entity-chip" data-entity-id="'+esc(page.entityInfo.id)+'" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);font-size:13px"><strong>'+esc(page.entityInfo.canonicalName)+'</strong><code style="font-size:11px">'+esc(page.entityInfo.type)+'</code></span></div></div>';
   }
-  if(page.markdown)html+='<div class="slideOver-section"><div class="md-content">'+renderMarkdown(page.markdown)+'</div></div>';
+  if(page.markdown){
+    const md=hasClaims?stripRedundantWikiClaimsSection(page.markdown):page.markdown;
+    html+='<div class="slideOver-section"><h3>Wiki</h3><div class="md-content">'+renderMarkdown(md)+'</div></div>';
+  }
   const sparse=!hasSummary&&!hasClaims&&!hasLinks&&!hasMd;
   if(sparse){
     html+='<div class="slideOver-section"><p style="font-size:13px;color:var(--text-dim);line-height:1.45">This page has no claims or compiled wiki file yet. Ingest sources that mention this topic, or edit the vault if this is a primary entity.</p></div>';
@@ -1041,7 +1166,7 @@ async function openPage(pageId){
   }
   html+='<div class="slideOver-section" style="border-top:2px solid var(--red-dim);padding-top:16px;margin-top:8px"><button id="delete-page-btn" style="background:var(--red-dim);color:var(--red);border:1px solid transparent;border-radius:var(--radius-xs);padding:6px 16px;cursor:pointer;font-size:12px;font-weight:600;transition:var(--transition)" onmouseover="this.style.background=\\'var(--red)\\';this.style.color=\\'white\\'" onmouseout="this.style.background=\\'var(--red-dim)\\';this.style.color=\\'var(--red)\\'">Delete Page</button></div>';
   openSlideOver(html,page.title);
-  document.querySelectorAll('.del-page-claim').forEach(btn=>{btn.addEventListener('click',async()=>{if(!confirm('Delete this claim?'))return;await fetch('/api/claim?id='+btn.dataset.claimId,{method:'DELETE'});await refreshData();openPage(page.id);});});
+  document.querySelectorAll('.del-page-claim').forEach(btn=>{btn.addEventListener('click',async function(e){e.stopPropagation();if(!confirm('Delete this claim?'))return;await fetch('/api/claim?id='+btn.dataset.claimId,{method:'DELETE'});await refreshData();openPage(page.id);});});
   document.getElementById('delete-page-btn').addEventListener('click',async()=>{if(!confirm('Delete page "'+page.title+'" and all its claims?'))return;await fetch('/api/page?id='+page.id,{method:'DELETE'});await refreshData();closeSlideOver();renderPages();});
 }
 
@@ -1077,6 +1202,19 @@ async function openSource(sourceId){
 function confBadge(val){const pct=(val*100).toFixed(0)+'%';if(val>=0.8)return'<span class="badge badge-green">'+pct+'</span>';if(val>=0.4)return'<span class="badge badge-yellow">'+pct+'</span>';return'<span class="badge badge-red">'+pct+'</span>';}
 function relTime(iso){if(!iso)return'';const diff=Date.now()-new Date(iso).getTime();if(diff<3600000)return Math.floor(diff/60000)+'m ago';if(diff<86400000)return Math.floor(diff/3600000)+'h ago';return Math.floor(diff/86400000)+'d ago';}
 function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';}
+function formatRelationListItem(r){
+  const conf=typeof r.confidence==='number'?r.confidence:0.8;
+  const statusLabel=esc(r.status||'active');
+  const vf=r.validFrom,vt=r.validTo;
+  const bits=[];
+  if(vf||vt)bits.push('<span title="Validity window">'+esc((vf||'…')+' – '+(vt||'…'))+'</span>');
+  if(r.sourceClaimId)bits.push('<button type="button" class="source-claim-link" data-claim-id="'+esc(r.sourceClaimId)+'" title="'+esc(r.sourceClaimId)+'" style="font-size:11px;background:none;border:none;padding:0;color:var(--accent);cursor:pointer;text-decoration:underline;font-family:inherit">View source claim</button><code style="font-size:10px;color:var(--text-xdim);margin-left:6px">'+esc(r.sourceClaimId.slice(0,8))+'…</code>');
+  if(r.updatedAt)bits.push('<span style="color:var(--text-xdim)">updated '+relTime(r.updatedAt)+'</span>');
+  const sub=bits.length?('<div style="font-size:11px;color:var(--text-dim);margin-top:6px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;line-height:1.4">'+bits.join('')+'</div>'):'';
+  const meta=r.metadata&&typeof r.metadata==='object'&&r.metadata!==null&&Object.keys(r.metadata).length>0?r.metadata:null;
+  const metaBlock=meta?('<details style="margin-top:8px;font-size:11px"><summary style="cursor:pointer;color:var(--text-dim);font-weight:500">Metadata</summary><pre style="margin-top:6px;padding:8px 10px;background:var(--surface2);border-radius:var(--radius-xs);border:1px solid var(--border);overflow:auto;max-height:160px;white-space:pre-wrap;font-size:10px">'+esc(JSON.stringify(meta,null,2))+'</pre></details>'):'';
+  return '<li style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--surface2)"><div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px;line-height:1.5"><code>'+esc(r.relationType)+'</code><span style="color:var(--text-xdim)">→</span><strong class="entity-chip" data-entity-id="'+esc(r.otherEntityId)+'" style="cursor:pointer">'+esc(r.otherCanonicalName)+'</strong><span style="color:var(--text-dim);font-size:12px">('+esc(r.direction)+')</span>'+confBadge(conf)+'<span style="font-size:11px;font-weight:600;color:var(--text-dim)">'+statusLabel+'</span></div>'+sub+metaBlock+'</li>';
+}
 function formatEntityLocationHtml(meta){
   if(!meta||typeof meta!=='object')return '';
   const dec=meta.coordinates_decimal;
@@ -1108,6 +1246,21 @@ function claimTypeBadge(t){
   const map={fact:'#78716C',observation:'#0EA5E9',preference:'#16A34A',hypothesis:'#A855F7',status:'#CA8A04',attribute:'#6366F1'};
   const c=map[k]||'#78716C';
   return'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;background:'+c+'22;color:'+c+'">'+esc(k)+'</span>';
+}
+function stripRedundantWikiClaimsSection(md){
+  if(!md)return'';
+  const lines=md.split(/\\r?\\n/);
+  const out=[];let i=0;
+  while(i<lines.length){
+    if(/^##\\s+Claims\\s*$/i.test(lines[i])){
+      i++;
+      while(i<lines.length&&!/^##\\s/.test(lines[i]))i++;
+      continue;
+    }
+    out.push(lines[i]);
+    i++;
+  }
+  return out.join('\\n');
 }
 function renderMarkdown(md){
   if(!md)return'';
@@ -1250,26 +1403,47 @@ document.getElementById('page-search').addEventListener('input',applyPageFilter)
 function renderEntities(){applyEntityFilter();}
 function applyEntityFilter(){
   const q=(document.getElementById('entity-search').value||'').toLowerCase();
+  const entSortEl=document.getElementById('entity-sort');
+  const sortMode=entSortEl?entSortEl.value:'rels-desc';
   let list=DATA.entities||[];
   if(q)list=list.filter(e=>(e.canonicalName||'').toLowerCase().includes(q)||(e.type||'').toLowerCase().includes(q)||JSON.stringify(e.metadata||{}).toLowerCase().includes(q));
-  const byType={};
-  for(const e of list){
-    const t=e.type||'unknown';
-    (byType[t]=byType[t]||[]).push(e);
+  function nameCmp(a,b){
+    return String(a.canonicalName||'').localeCompare(String(b.canonicalName||''),undefined,{sensitivity:'base'});
   }
-  const keys=Object.keys(byType).sort();
+  function rowHtml(e){
+    const pageCell=e.primaryPageId?'<span class="page-link-entity" data-page-id="'+esc(e.primaryPageId)+'" style="cursor:pointer;color:var(--accent)">open</span>':'—';
+    return '<tr data-entity-id="'+esc(e.id)+'" style="cursor:pointer"><td>'+esc(e.canonicalName)+'</td><td><code style="font-size:11px">'+esc(e.type)+'</code></td><td>'+esc(e.status||'active')+'</td><td style="text-align:center">'+(e.aliasCount||0)+'</td><td style="text-align:center">'+(e.claimCount||0)+'</td><td style="text-align:center">'+(e.relationCount||0)+'</td><td>'+pageCell+'</td></tr>';
+  }
   let html='';
-  for(const t of keys){
-    html+='<tr class="entity-kind-section"><td colspan="7" style="background:var(--surface-hover);font-weight:600;padding:8px 12px">'+esc(t)+' <span style="font-weight:400;color:var(--text-dim)">('+byType[t].length+')</span></td></tr>';
-    for(const e of byType[t]){
-      const pageCell=e.primaryPageId?'<span class="page-link-entity" data-page-id="'+esc(e.primaryPageId)+'" style="cursor:pointer;color:var(--accent)">open</span>':'—';
-      html+='<tr data-entity-id="'+esc(e.id)+'" style="cursor:pointer"><td>'+esc(e.canonicalName)+'</td><td><code style="font-size:11px">'+esc(e.type)+'</code></td><td>'+esc(e.status||'active')+'</td><td style="text-align:center">'+(e.aliasCount||0)+'</td><td style="text-align:center">'+(e.claimCount||0)+'</td><td style="text-align:center">'+(e.relationCount||0)+'</td><td>'+pageCell+'</td></tr>';
+  if(sortMode==='rels-desc'||sortMode==='rels-asc'){
+    const relMul=sortMode==='rels-desc'?-1:1;
+    const sorted=list.slice().sort((a,b)=>{
+      const ar=a.relationCount||0,br=b.relationCount||0;
+      if(ar!==br)return relMul*(ar-br);
+      return nameCmp(a,b);
+    });
+    for(const e of sorted)html+=rowHtml(e);
+  }else{
+    const byType={};
+    for(const e of list){
+      const t=e.type||'unknown';
+      (byType[t]=byType[t]||[]).push(e);
+    }
+    const keys=Object.keys(byType).sort();
+    for(const t of keys){
+      let group=byType[t].slice();
+      if(sortMode==='name-asc')group.sort(nameCmp);
+      else group.sort((a,b)=>nameCmp(b,a));
+      html+='<tr class="entity-kind-section"><td colspan="7" style="background:var(--surface-hover);font-weight:600;padding:8px 12px">'+esc(t)+' <span style="font-weight:400;color:var(--text-dim)">('+group.length+')</span></td></tr>';
+      for(const e of group)html+=rowHtml(e);
     }
   }
   if(!html)html='<tr><td colspan="7" style="padding:16px;color:var(--text-dim)">No entities yet. Ingest typed vault notes (person, project, …) to create entity rows.</td></tr>';
   document.getElementById('entities-table').innerHTML=html;
 }
 document.getElementById('entity-search').addEventListener('input',applyEntityFilter);
+const entitySortEl=document.getElementById('entity-sort');
+if(entitySortEl)entitySortEl.addEventListener('change',applyEntityFilter);
 async function openEntity(entityId){
   const d=await fetch('/api/entity?id='+encodeURIComponent(entityId)).then(r=>r.json());
   if(d.error){alert(d.error);return;}
@@ -1278,8 +1452,8 @@ async function openEntity(entityId){
   html+=formatEntityLocationHtml(d.entity.metadata);
   if(d.summary&&d.summary.body)html+='<div class="slideOver-section"><h3>Summary'+(d.summary.stale?' <span style="font-size:10px;font-weight:400;color:var(--yellow);margin-left:6px">stale</span>':'')+'</h3><p style="font-size:13px;color:var(--text-dim);line-height:1.5;white-space:pre-wrap">'+esc(d.summary.body)+'</p></div>';
   if(d.relations&&d.relations.length){
-    html+='<div class="slideOver-section"><h3>Relations ('+d.relations.length+')</h3><ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5">';
-    html+=d.relations.map(r=>'<li><code>'+esc(r.relationType)+'</code> → <strong class="entity-chip" data-entity-id="'+esc(r.otherEntityId)+'" style="cursor:pointer">'+esc(r.otherCanonicalName)+'</strong> <span style="color:var(--text-dim)">('+esc(r.direction)+')</span></li>').join('');
+    html+='<div class="slideOver-section"><h3>Relations ('+d.relations.length+')</h3><ul style="margin:0;padding-left:0;list-style:none;font-size:13px">';
+    html+=d.relations.map(formatRelationListItem).join('');
     html+='</ul></div>';
   }
   if(d.claims&&d.claims.length){
@@ -1291,7 +1465,7 @@ async function openEntity(entityId){
   html+='<div class="slideOver-section"><details><summary style="cursor:pointer;font-weight:600;font-size:14px">Metadata</summary><pre style="font-size:11px;overflow:auto;max-height:180px;background:var(--surface);padding:10px;border-radius:6px;margin-top:8px">'+esc(meta)+'</pre></details></div>';
   html+='<div class="slideOver-section"><h3>Compiled views</h3><p style="font-size:12px;color:var(--text-dim)">Cached LLM summaries (regenerate on demand).</p>';
   html+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0">';
-  [['summary','Summary'],['agent_context','Agent ctx'],['status_card','Status'],['briefing','Briefing']].forEach(function(p){html+='<button type="button" class="cv-load" data-vt="'+p[0]+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">'+p[1]+'</button>';});
+  [['summary','Summary'],['agent_context','Agent ctx'],['status_card','Status'],['briefing','Briefing'],['open_questions','Open Q'],['support_gaps','Support']].forEach(function(p){html+='<button type="button" class="cv-load" data-vt="'+p[0]+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">'+p[1]+'</button>';});
   html+='</div><pre id="cv-out" style="font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;background:var(--surface);padding:10px;border-radius:6px;margin:0">Select a tab…</pre></div>';
   if(d.primaryPageId)html+='<div style="margin-top:12px"><button type="button" class="open-primary-page-btn" data-page-id="'+esc(d.primaryPageId)+'" style="background:var(--accent);color:white;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px">Open primary page</button></div>';
   openSlideOver(html,d.entity.canonicalName);
@@ -1307,7 +1481,58 @@ async function openEntity(entityId){
   const ob=sbody.querySelector('.open-primary-page-btn');
   if(ob)ob.addEventListener('click',()=>openPage(ob.dataset.pageId));
 }
+function claimRefList(label,ids){
+  if(!ids||!ids.length)return'';
+  const items=ids.map(function(cid){return'<button type="button" class="claim-ref-link" data-claim-id="'+esc(cid)+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--accent);padding:3px 8px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;margin:2px 6px 2px 0" title="'+esc(cid)+'">'+esc(cid.slice(0,8))+'…</button>';}).join('');
+  return'<div class="slideOver-section"><h3 style="margin-bottom:8px">'+esc(label)+'</h3><div style="display:flex;flex-wrap:wrap;align-items:center">'+items+'</div></div>';
+}
+async function openClaim(claimId){
+  const d=await fetch('/api/claim?id='+encodeURIComponent(claimId)).then(r=>r.json());
+  if(d.error){alert(d.error);return;}
+  let html='<div class="slideOver-section"><p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">Claim id <code style="font-size:11px;user-select:all">'+esc(d.id)+'</code></p></div>';
+  html+='<div class="slideOver-section" style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">'+confBadge(d.confidence)+claimTypeBadge(d.claimType||'fact')+'<div style="flex:1;font-size:14px;line-height:1.55">'+esc(d.statement)+'</div></div>';
+  html+='<div class="slideOver-section"><h3 style="margin-bottom:8px">Timing and decay</h3><div style="font-size:12px;color:var(--text-dim);display:grid;gap:6px;line-height:1.45">';
+  if(d.firstStated)html+='<div>First stated: <span style="color:var(--text)">'+esc(new Date(d.firstStated).toLocaleString())+'</span></div>';
+  if(d.lastReinforced)html+='<div>Last reinforced: <span style="color:var(--text)">'+relTime(d.lastReinforced)+'</span> <span style="color:var(--text-xdim)">('+esc(d.lastReinforced)+')</span></div>';
+  if(d.decayRate!=null&&!Number.isNaN(d.decayRate))html+='<div>Decay rate: <span style="color:var(--text)">'+esc(String(d.decayRate))+'</span> · used as <code style="font-size:11px">confidence × e^(−rate × days since reinforcement)</code></div>';
+  html+='</div></div>';
+  if(d.tags&&d.tags.length)html+='<div class="slideOver-section"><h3 style="margin-bottom:8px">Tags</h3><div style="display:flex;flex-wrap:wrap;gap:6px">'+d.tags.map(function(t){return'<span class="badge badge-accent" style="font-size:11px">'+esc(t)+'</span>';}).join('')+'</div></div>';
+  html+='<div class="slideOver-section"><h3 style="margin-bottom:8px">Sources</h3>';
+  if(d.sources&&d.sources.length){
+    html+='<div style="display:flex;flex-direction:column;gap:8px;font-size:13px">';
+    html+=d.sources.map(function(s){
+      return'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-xs)"><button type="button" class="claim-source-chip" data-source-id="'+esc(s.id)+'" style="background:none;border:none;padding:0;color:var(--accent);cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;text-align:left;flex:1;min-width:0">'+esc(s.title)+'</button><span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--accent-dim);color:var(--accent)">'+esc(s.type)+'</span><span style="font-size:10px;color:var(--text-xdim)">'+esc(s.qualityTier||'')+'</span><span style="font-size:11px;color:var(--text-dim);word-break:break-all;flex-basis:100%" title="'+esc(s.path||'')+'">'+esc(s.path||'—')+'</span></div>';
+    }).join('');
+    html+='</div>';
+  }else{html+='<p style="font-size:13px;color:var(--text-dim);margin:0">No sources linked.</p>';}
+  html+='</div>';
+  html+=claimRefList('Depends on',d.dependsOn);
+  html+=claimRefList('Contradicted by',d.contradictedBy);
+  html+=claimRefList('Derived claims',d.derivedClaims);
+  if(d.timeline&&d.timeline.length){
+    html+='<div class="slideOver-section"><h3 style="margin-bottom:10px">Epistemic timeline</h3><div style="max-height:220px;overflow-y:auto">';
+    html+=d.timeline.slice().reverse().map(function(ev){
+      const up=ev.confidenceAfter>=ev.confidenceBefore;
+      const src=ev.triggerSourceId?'<button type="button" class="claim-source-chip" data-source-id="'+esc(ev.triggerSourceId)+'" style="background:none;border:none;padding:0;color:var(--accent);cursor:pointer;font-size:11px;font-family:inherit">source</button>':'';
+      return'<div style="padding:8px 0;border-bottom:1px solid var(--surface2);font-size:12px"><div style="color:var(--text-xdim)">'+esc(new Date(ev.date).toLocaleString())+' · <span style="font-weight:600;text-transform:capitalize;color:var(--text)">'+esc(ev.type)+'</span> '+src+'</div><div style="margin-top:3px;color:var(--text-dim)">'+(ev.note?esc(ev.note):'')+' <span style="color:'+(up?'var(--green)':'var(--red)')+';font-weight:600">'+((ev.confidenceBefore*100).toFixed(0)+'% → '+(ev.confidenceAfter*100).toFixed(0)+'%')+'</span></div></div>';
+    }).join('');
+    html+='</div></div>';
+  }
+  if(d.pageId)html+='<div class="slideOver-section"><button type="button" class="open-page-from-claim" data-page-id="'+esc(d.pageId)+'" style="background:var(--accent);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px">Open page'+(d.pageTitle?': '+esc(d.pageTitle):'')+'</button></div>';
+  openSlideOver(html,'Claim');
+  const sbody=document.getElementById('slideOver-body');
+  const op=sbody&&sbody.querySelector('.open-page-from-claim');
+  if(op)op.addEventListener('click',()=>openPage(op.dataset.pageId));
+}
 document.addEventListener('click',e=>{
+  const pcr=e.target.closest('.page-claim-row');
+  if(pcr&&!e.target.closest('.del-page-claim')){e.preventDefault();e.stopPropagation();openClaim(pcr.dataset.claimId);return;}
+  const clRef=e.target.closest('.claim-ref-link');
+  if(clRef){e.preventDefault();e.stopPropagation();openClaim(clRef.dataset.claimId);return;}
+  const cSrc=e.target.closest('.claim-source-chip');
+  if(cSrc){e.preventDefault();e.stopPropagation();openSource(cSrc.dataset.sourceId);return;}
+  const scl=e.target.closest('.source-claim-link');
+  if(scl){e.preventDefault();e.stopPropagation();openClaim(scl.dataset.claimId);return;}
   const chip=e.target.closest('.entity-chip');
   if(chip){e.stopPropagation();openEntity(chip.dataset.entityId);return;}
   const entRow=e.target.closest('tr[data-entity-id]');
@@ -1376,10 +1601,22 @@ function renderHealth(){
       '<div><div style="font-weight:700;color:var(--text);font-size:18px">'+ont.staleCompiledViewCount+'</div>Stale views</div>'+
       '</div>';
   }
-  const actions=health.suggestedActions.length?health.suggestedActions:['No actions needed.'];
+  const actions=health.suggestedActions&&health.suggestedActions.length?health.suggestedActions:['No actions needed.'];
   document.getElementById('health-actions').innerHTML=actions.map(a=>'<li>💡 '+esc(a)+'</li>').join('');
   document.getElementById('stale-claims').innerHTML=health.staleClaims.length===0?'<p style="color:var(--text-dim)">None</p>':'<table><tbody>'+health.staleClaims.slice(0,8).map(c=>'<tr><td>'+esc(c.statement.slice(0,50))+'…</td><td style="color:var(--yellow);text-align:right">'+c.daysSince+'d</td></tr>').join('')+'</tbody></table>';
   document.getElementById('contested-claims').innerHTML=health.contestedClaims.length===0?'<p style="color:var(--text-dim)">None</p>':'<table><tbody>'+health.contestedClaims.map(c=>'<tr><td>'+esc(c.statement.slice(0,50))+'…</td><td style="color:var(--red);text-align:right">'+c.contradictions+'</td></tr>').join('')+'</tbody></table>';
+  const oi=health.openIssues||[];const ko=document.getElementById('health-open-issues');
+  if(ko){
+    if(!oi.length){ko.innerHTML='<p style="color:var(--text-dim)">None</p>';}
+    else{
+      const by={pending_alias:0,unresolved_contradiction:0,unsupported_hypothesis:0};
+      oi.forEach(function(i){if(by[i.kind]!=null)by[i.kind]++;});
+      const labels={pending_alias:'Pending aliases',unresolved_contradiction:'Contradictions',unsupported_hypothesis:'Unsupported hypotheses'};
+      let chips='';
+      for(var k in by){if(by[k])chips+='<span style="display:inline-block;margin:0 8px 8px 0;padding:4px 10px;background:var(--surface2);border-radius:999px;font-size:12px">'+labels[k]+': <strong>'+by[k]+'</strong></span>';}
+      ko.innerHTML='<div style="margin-bottom:10px">'+chips+'</div><table style="width:100%;font-size:13px"><tbody>'+oi.slice(0,10).map(function(i){return'<tr><td style="padding:6px 0;border-bottom:1px solid var(--border);vertical-align:top;width:140px"><span style="font-size:11px;color:var(--text-dim)">'+esc(i.kind)+'</span></td><td style="padding:6px 0 6px 10px;border-bottom:1px solid var(--border)">'+esc(i.summary)+'</td></tr>';}).join('')+'</tbody></table>'+(oi.length>10?'<p style="font-size:12px;color:var(--text-dim);margin:8px 0 0">Showing 10 of '+oi.length+'</p>':'');
+    }
+  }
 }
 function healthRing(pct,color,label,count){
   const r=38,circ=2*Math.PI*r;
@@ -1651,7 +1888,7 @@ function renderChatSuggestions(){
   const suggestions=[];
   if(DATA.pages.length)suggestions.push('Tell me about '+DATA.pages[0].title);
   suggestions.push('What are the key concepts?','Which claims need more evidence?','How do the topics connect?');
-  if(DATA.health.contestedClaims.length)suggestions.push('What claims are contested?');
+  if(DATA.health&&DATA.health.contestedClaims&&DATA.health.contestedClaims.length)suggestions.push('What claims are contested?');
   document.getElementById('chat-suggestions').innerHTML=suggestions.map(s=>'<button class="chat-suggestion" data-q="'+esc(s)+'">'+esc(s)+'</button>').join('');
   document.querySelectorAll('.chat-suggestion').forEach(btn=>{btn.addEventListener('click',()=>askQuestion(btn.dataset.q));});
 }
@@ -1755,6 +1992,46 @@ async function runGraphLookup(){
 }
 document.getElementById('graph-lookup-run').addEventListener('click',runGraphLookup);
 document.getElementById('graph-lookup-entity-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runGraphLookup();}});
+
+(function(){
+  const dr=document.getElementById('discover-run');
+  const dm=document.getElementById('discover-mode');
+  const ds=document.getElementById('discover-status');
+  const dres=document.getElementById('discover-results');
+  if(!dr)return;
+  dr.addEventListener('click',async function(){
+    const mode=dm?dm.value:'contradictions';
+    dr.disabled=true;
+    if(ds)ds.textContent='Running…';
+    if(dres)dres.innerHTML='';
+    try{
+      const r=await fetch('/api/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
+      const data=await r.json();
+      if(!r.ok){
+        if(dres)dres.innerHTML='<p style="color:var(--red)">'+esc(data.error||'Request failed')+'</p>';
+      }else if(data.discoveries&&data.discoveries.length){
+        const pri={high:'var(--red)',medium:'var(--yellow)',low:'var(--green)'};
+        if(dres)dres.innerHTML=data.discoveries.map(function(d){
+          const col=pri[d.priority]||'var(--text)';
+          const sq=(d.suggestedQueries&&d.suggestedQueries.length)?'<p style="font-size:12px;margin:8px 0 0"><span style="color:var(--text-dim)">Try search:</span> '+d.suggestedQueries.map(function(q){return'<button type="button" class="discover-sq" data-q="'+esc(q)+'" style="margin:2px 6px 2px 0;background:var(--surface2);border:1px solid var(--border);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:12px;color:var(--accent);font-family:inherit">'+esc(q)+'</button>';}).join('')+'</p>':'';
+          return'<div style="padding:12px 0;border-bottom:1px solid var(--border)"><div style="font-weight:600;color:'+col+'">'+esc(d.title)+'</div><p style="margin:6px 0 0;font-size:13px;color:var(--text-dim);line-height:1.45">'+esc(d.description)+'</p>'+sq+'</div>';
+        }).join('');
+        document.querySelectorAll('.discover-sq').forEach(function(b){
+          b.addEventListener('click',function(){
+            const gsi=document.getElementById('global-search');
+            if(gsi){gsi.value=b.dataset.q;gsi.focus();gsi.dispatchEvent(new Event('input',{bubbles:true}));}
+          });
+        });
+      }else{
+        if(dres)dres.innerHTML='<p style="color:var(--text-dim)">No items returned.</p>';
+      }
+    }catch(err){
+      if(dres)dres.innerHTML='<p style="color:var(--red)">'+esc(err.message||String(err))+'</p>';
+    }
+    dr.disabled=false;
+    if(ds)ds.textContent='';
+  });
+})();
 
 setInterval(async()=>{try{const s=await fetch('/api/stats').then(r=>r.json());if(JSON.stringify(s)!==JSON.stringify(DATA.stats)){await fetchAll();renderAll();}}catch{}},5000);
 

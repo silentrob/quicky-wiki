@@ -946,14 +946,13 @@ export class KnowledgeStore {
     aliases: string[];
     primaryPage: WikiPage | null;
     claims: Claim[];
-    relations: Array<{
-      id: string;
-      relationType: string;
-      confidence: number;
-      otherEntityId: string;
-      otherCanonicalName: string;
-      direction: "outbound" | "inbound";
-    }>;
+    relations: Array<
+      KnowledgeRelation & {
+        otherEntityId: string;
+        otherCanonicalName: string;
+        direction: "outbound" | "inbound";
+      }
+    >;
   } | null {
     const entity = this.getEntity(entityId);
     if (!entity) return null;
@@ -973,8 +972,7 @@ export class KnowledgeStore {
       : [];
     const relRows = this.db
       .prepare(
-        `SELECT r.id, r.from_entity_id, r.to_entity_id, r.relation_type, r.confidence
-         FROM relations r
+        `SELECT * FROM relations r
          WHERE r.from_entity_id = ? OR r.to_entity_id = ?`,
       )
       .all(entityId, entityId) as any[];
@@ -983,9 +981,7 @@ export class KnowledgeStore {
       const otherId = outbound ? r.to_entity_id : r.from_entity_id;
       const other = this.getEntity(otherId);
       return {
-        id: r.id,
-        relationType: r.relation_type,
-        confidence: r.confidence,
+        ...this.rowToRelation(r),
         otherEntityId: otherId,
         otherCanonicalName: other?.canonicalName ?? otherId,
         direction: outbound ? ("outbound" as const) : ("inbound" as const),
@@ -2183,6 +2179,61 @@ export class KnowledgeStore {
     return out;
   }
 
+  /**
+   * Resolve claims by full UUID or by id prefix (≥8 hex chars). Used by dashboard search
+   * and hybrid search so pasted claim ids find a row without FTS.
+   */
+  searchClaimsByIdFragment(
+    query: string,
+    limit: number = 20,
+  ): {
+    id: string;
+    statement: string;
+    pageId: string;
+    confidence: number;
+    claimType: ClaimType;
+    type: "claim";
+  }[] {
+    const q = query.trim();
+    if (!q) return [];
+    const fullUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        q,
+      );
+    if (fullUuid) {
+      const c =
+        this.getClaim(q) ||
+        this.getClaim(q.toLowerCase());
+      if (!c) return [];
+      return [
+        {
+          id: c.id,
+          statement: c.statement,
+          pageId: c.pageId,
+          confidence: c.confidence,
+          claimType: c.claimType,
+          type: "claim" as const,
+        },
+      ];
+    }
+    const compact = q.replace(/-/g, "");
+    if (!/^[0-9a-f]+$/i.test(compact) || compact.length < 8) return [];
+    const likeParam = `${q}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT id, statement, page_id, confidence, claim_type FROM claims WHERE LOWER(id) LIKE LOWER(?) LIMIT ?`,
+      )
+      .all(likeParam, limit) as any[];
+    return rows.map((r) => ({
+      id: r.id,
+      statement: r.statement,
+      pageId: r.page_id,
+      confidence: r.confidence,
+      claimType: normalizeClaimType(r.claim_type),
+      type: "claim" as const,
+    }));
+  }
+
   search(
     query: string,
     limit: number = 20,
@@ -2195,6 +2246,10 @@ export class KnowledgeStore {
       to: { id: string; name: string; type: string };
     }>;
   } {
+    const byId = this.searchClaimsByIdFragment(query, limit);
+    if (byId.length > 0) {
+      return { pages: [], claims: byId, relations: [] };
+    }
     const safeQ = query.replace(/[^a-zA-Z0-9\s]/g, "").trim();
     if (!safeQ) return { pages: [], claims: [], relations: [] };
     const stopWords = new Set([

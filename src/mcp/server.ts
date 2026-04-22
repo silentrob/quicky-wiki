@@ -161,7 +161,7 @@ const TOOLS = [
   {
     name: "health_report",
     description:
-      "Get the knowledge base health report: confidence distribution, stale claims, contested claims, gaps.",
+      "Get the knowledge base health report: confidence distribution, stale claims, contested claims, deterministic openIssues (pending aliases, stored contradictions, unsupported hypotheses), and suggested actions.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -210,7 +210,7 @@ const TOOLS = [
   {
     name: "get_compiled_view",
     description:
-      "Get or generate a compiled LLM view for an entity: summary, agent_context, status_card, or briefing.",
+      "Get or generate a compiled LLM view for an entity: summary, agent_context, status_card, briefing, open_questions, or support_gaps.",
     inputSchema: {
       type: "object",
       properties: {
